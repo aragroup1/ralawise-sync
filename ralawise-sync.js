@@ -6,7 +6,8 @@ const path = require('path');
 const axios = require('axios');
 const AdmZip = require('adm-zip');
 const cron = require('node-cron');
-const { Readable } = require('stream');
+// Import Writable along with Readable
+const { Readable, Writable } = require('stream'); 
 require('dotenv').config();
 
 const app = express();
@@ -116,6 +117,7 @@ function delay(ms) {
 // FTP FUNCTIONS
 // ============================================
 
+// --- THIS IS THE CORRECTED FUNCTION ---
 async function fetchInventoryFromFTP() {
   const client = new ftp.Client();
   client.ftp.verbose = false;
@@ -127,22 +129,25 @@ async function fetchInventoryFromFTP() {
     const csvPath = '/Stock/Stock_Update.csv';
     addLog(`Downloading ${csvPath}...`, 'info');
     
-    // Download to buffer first
+    // Create a custom Writable stream to collect data chunks in an array
     const chunks = [];
-    await client.downloadTo(
-      new Readable({
-        write(chunk, encoding, callback) {
-          chunks.push(chunk);
-          callback();
-        }
-      }),
-      csvPath
-    );
-    
+    const destination = new Writable({
+      write(chunk, encoding, callback) {
+        chunks.push(chunk);
+        callback();
+      }
+    });
+
+    // Download the file to our in-memory destination stream
+    await client.downloadTo(destination, csvPath);
+
+    // Once done, combine the chunks into a single buffer
     const buffer = Buffer.concat(chunks);
+    
+    // Create a NEW Readable stream from the final buffer for the CSV parser
     const stream = Readable.from(buffer);
     
-    addLog('FTP download successful', 'success');
+    addLog(`FTP download successful, ${buffer.length} bytes received`, 'success');
     return stream;
   } catch (error) {
     addLog(`FTP error: ${error.message}`, 'error');
@@ -196,33 +201,24 @@ async function getAllShopifyProducts() {
   try {
     addLog('Fetching all products from Shopify...', 'info');
     
-    while (true) {
-      pageCount++;
-      let url = `/products.json?limit=${limit}&fields=id,handle,title,variants,tags,status`;
-      
-      if (pageInfo) {
-        url += `&page_info=${pageInfo}`;
-      }
-      
-      const response = await shopifyClient.get(url);
-      const products = response.data.products;
-      allProducts.push(...products);
-      
-      addLog(`Fetched page ${pageCount}: ${products.length} products (total: ${allProducts.length})`, 'info');
-      
-      // Check for next page
-      const linkHeader = response.headers.link;
-      if (linkHeader && linkHeader.includes('rel="next"')) {
-        const matches = linkHeader.match(/page_info=([^>;&]+)/);
-        if (matches) {
-          pageInfo = matches[1];
-          await delay(250); // Rate limiting
+    let url = `/products.json?limit=${limit}&fields=id,handle,title,variants,tags,status`;
+
+    while (url) {
+        pageCount++;
+        const response = await shopifyClient.get(url);
+        const products = response.data.products;
+        allProducts.push(...products);
+
+        addLog(`Fetched page ${pageCount}: ${products.length} products (total: ${allProducts.length})`, 'info');
+
+        const linkHeader = response.headers.link;
+        if (linkHeader && linkHeader.includes('rel="next"')) {
+            const matches = linkHeader.match(/<([^>]+)>/);
+            url = matches ? matches[1] : null;
         } else {
-          break;
+            url = null;
         }
-      } else {
-        break;
-      }
+        await delay(250); // Rate limiting
     }
     
     addLog(`Completed fetching ${allProducts.length} products from Shopify`, 'success');
@@ -334,7 +330,8 @@ async function updateInventoryBySKU(inventoryMap) {
         await delay(250); // Rate limiting
       } catch (error) {
         errors++;
-        addLog(`Failed to update ${sku}: ${error.message}`, 'error');
+        const errorMessage = error.response ? JSON.stringify(error.response.data) : error.message;
+        addLog(`Failed to update ${sku}: ${errorMessage}`, 'error');
         
         if (error.response?.status === 429) {
           addLog('Rate limit hit, waiting 5 seconds...', 'warning');
@@ -376,7 +373,7 @@ async function downloadAndExtractZip() {
     
     const response = await axios.get(url, {
       responseType: 'arraybuffer',
-      timeout: 60000,
+      timeout: 120000, // Increased timeout to 2 minutes
       maxContentLength: 100 * 1024 * 1024 // 100MB max
     });
     
@@ -665,7 +662,8 @@ async function processFullImport(csvFiles) {
         await delay(1000); // Rate limiting
       } catch (error) {
         errors++;
-        addLog(`❌ Failed to create ${product.title}: ${error.message}`, 'error');
+        const errorMessage = error.response ? JSON.stringify(error.response.data) : error.message;
+        addLog(`❌ Failed to create ${product.title}: ${errorMessage}`, 'error');
         
         if (error.response?.status === 429) {
           addLog('Rate limit hit, waiting 10 seconds...', 'warning');
@@ -747,23 +745,14 @@ async function processFullImport(csvFiles) {
 
 async function syncInventory() {
   try {
-    addLog('=== INVENTORY SYNC STARTED ===', 'info');
+    addLog('=== INVENTORY SYNC TRIGGERED ===', 'info');
     
-    // Fetch CSV from FTP
     const stream = await fetchInventoryFromFTP();
+    await updateInventoryBySKU(await parseInventoryCSV(stream));
     
-    // Parse inventory data
-    const inventoryMap = await parseInventoryCSV(stream);
-    
-    // Update Shopify
-    const result = await updateInventoryBySKU(inventoryMap);
-    
-    addLog('=== INVENTORY SYNC COMPLETE ===', 'success');
-    return result;
   } catch (error) {
-    addLog(`Inventory sync error: ${error.message}`, 'error');
+    addLog(`Inventory sync process failed: ${error.message}`, 'error');
     lastRun.inventory.errors++;
-    throw error;
   }
 }
 
@@ -771,37 +760,26 @@ async function syncFullCatalog() {
   let tempDir;
   
   try {
-    addLog('=== FULL CATALOG SYNC STARTED ===', 'info');
+    addLog('=== FULL CATALOG SYNC TRIGGERED ===', 'info');
     
-    // Download and extract zip
     const { tempDir: dir, csvFiles } = await downloadAndExtractZip();
     tempDir = dir;
     
-    // Process import
-    const result = await processFullImport(csvFiles);
+    await processFullImport(csvFiles);
     
-    // Cleanup temp files
-    if (tempDir) {
-      fs.rmSync(tempDir, { recursive: true, force: true });
-      addLog('Cleaned up temporary files', 'info');
-    }
-    
-    addLog('=== FULL CATALOG SYNC COMPLETE ===', 'success');
-    return result;
   } catch (error) {
-    addLog(`Full catalog sync error: ${error.message}`, 'error');
+    addLog(`Full catalog sync process failed: ${error.message}`, 'error');
     lastRun.fullImport.errors++;
-    
-    // Cleanup on error
+  } finally {
+    // Cleanup temp files
     if (tempDir) {
       try {
         fs.rmSync(tempDir, { recursive: true, force: true });
+        addLog('Cleaned up temporary files', 'info');
       } catch (cleanupError) {
         addLog(`Cleanup error: ${cleanupError.message}`, 'warning');
       }
     }
-    
-    throw error;
   }
 }
 
@@ -851,8 +829,8 @@ app.get('/', (req, res) => {
           gap: 20px; 
         }
         .stat { 
-          background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-          color: white;
+          background: linear-gradient(135deg, #f5f7fa 0%, #c3cfe2 100%);
+          color: #333;
           padding: 20px; 
           border-radius: 8px;
           text-align: center;
@@ -867,6 +845,7 @@ app.get('/', (req, res) => {
         .stat p { 
           font-size: 32px; 
           font-weight: bold; 
+          color: #764ba2;
         }
         .stat small { 
           display: block;
@@ -895,6 +874,7 @@ app.get('/', (req, res) => {
           background: #ccc; 
           cursor: not-allowed;
           transform: none;
+          box-shadow: none;
         }
         .logs { 
           background: #1e1e1e; 
@@ -916,25 +896,22 @@ app.get('/', (req, res) => {
         .log-success { color: #56d364; }
         .log-warning { color: #f0ad4e; }
         .log-error { color: #f85149; }
-        .running { 
-          animation: pulse 2s infinite; 
-          background: #28a745 !important;
+        .status-badge {
+          display: inline-block;
+          padding: 8px 16px;
+          border-radius: 20px;
+          font-size: 14px;
+          font-weight: bold;
+          text-transform: uppercase;
+          animation: pulse 2s infinite;
         }
+        .status-idle { background: #56d364; color: white; animation: none; }
+        .status-running { background: #f0ad4e; color: #333; }
         @keyframes pulse { 
           0% { opacity: 1; } 
           50% { opacity: 0.6; } 
           100% { opacity: 1; } 
         }
-        .status-badge {
-          display: inline-block;
-          padding: 4px 12px;
-          border-radius: 20px;
-          font-size: 12px;
-          font-weight: bold;
-          text-transform: uppercase;
-        }
-        .status-idle { background: #28a745; color: white; }
-        .status-running { background: #ffc107; color: #333; }
       </style>
     </head>
     <body>
@@ -944,15 +921,13 @@ app.get('/', (req, res) => {
         <div class="card">
           <h2>System Status</h2>
           <div class="stats">
-            <div class="stat ${isRunning.inventory ? 'running' : ''}">
+            <div class="stat">
               <h3>Inventory Sync</h3>
-              <p>${isRunning.inventory ? '🔄' : '✅'}</p>
-              <small>${isRunning.inventory ? 'Running...' : 'Idle'}</small>
+              <p class="status-badge ${isRunning.inventory ? 'status-running' : 'status-idle'}">${isRunning.inventory ? 'Running' : 'Idle'}</p>
             </div>
-            <div class="stat ${isRunning.fullImport ? 'running' : ''}">
+            <div class="stat">
               <h3>Full Import</h3>
-              <p>${isRunning.fullImport ? '🔄' : '✅'}</p>
-              <small>${isRunning.fullImport ? 'Running...' : 'Idle'}</small>
+              <p class="status-badge ${isRunning.fullImport ? 'status-running' : 'status-idle'}">${isRunning.fullImport ? 'Running' : 'Idle'}</p>
             </div>
           </div>
         </div>
@@ -1070,16 +1045,8 @@ app.get('/', (req, res) => {
           window.location.reload();
         }
         
-        // Auto-refresh every 30 seconds if a job is running
-        const checkRefresh = () => {
-          const isRunning = ${isRunning.inventory || isRunning.fullImport};
-          if (isRunning) {
-            setTimeout(() => window.location.reload(), 30000);
-          } else {
-            setTimeout(() => window.location.reload(), 60000);
-          }
-        };
-        checkRefresh();
+        // Auto-refresh
+        setTimeout(() => window.location.reload(), 30000);
       </script>
     </body>
     </html>
@@ -1091,48 +1058,31 @@ app.get('/', (req, res) => {
 // API ENDPOINTS
 // ============================================
 
-app.get('/api/status', (req, res) => {
-  res.json({
-    isRunning,
-    lastRun,
-    logs: logs.slice(0, 100),
-    config: {
-      shopifyDomain: config.shopify.domain,
-      ftpHost: config.ftp.host,
-      maxInventory: config.ralawise.maxInventory
-    }
-  });
-});
-
 app.post('/api/sync/inventory', async (req, res) => {
   if (isRunning.inventory) {
-    return res.json({ error: 'Inventory sync already running' });
+    return res.status(409).json({ error: 'Inventory sync already running' });
   }
   
-  // Run in background
-  syncInventory().catch(error => {
-    addLog(`Background inventory sync failed: ${error.message}`, 'error');
-  });
+  // Run in background and don't wait for it to finish
+  syncInventory();
   
-  res.json({ success: true, message: 'Inventory sync started' });
+  res.json({ success: true, message: 'Inventory sync started in background' });
 });
 
 app.post('/api/sync/full', async (req, res) => {
   if (isRunning.fullImport) {
-    return res.json({ error: 'Full import already running' });
+    return res.status(409).json({ error: 'Full import already running' });
   }
   
   // Run in background
-  syncFullCatalog().catch(error => {
-    addLog(`Background full import failed: ${error.message}`, 'error');
-  });
+  syncFullCatalog();
   
-  res.json({ success: true, message: 'Full import started' });
+  res.json({ success: true, message: 'Full import started in background' });
 });
 
 app.post('/api/logs/clear', (req, res) => {
   logs = [];
-  addLog('Logs cleared', 'info');
+  addLog('Logs cleared manually', 'info');
   res.json({ success: true });
 });
 
@@ -1144,9 +1094,9 @@ app.post('/api/logs/clear', (req, res) => {
 cron.schedule('0 * * * *', () => {
   if (!isRunning.inventory) {
     addLog('⏰ Starting scheduled inventory sync...', 'info');
-    syncInventory().catch(error => {
-      addLog(`Scheduled inventory sync failed: ${error.message}`, 'error');
-    });
+    syncInventory();
+  } else {
+    addLog('⏰ Skipped scheduled inventory sync, previous job still running.', 'warning');
   }
 });
 
@@ -1154,9 +1104,9 @@ cron.schedule('0 * * * *', () => {
 cron.schedule('0 13 */2 * *', () => {
   if (!isRunning.fullImport) {
     addLog('⏰ Starting scheduled full catalog import...', 'info');
-    syncFullCatalog().catch(error => {
-      addLog(`Scheduled full import failed: ${error.message}`, 'error');
-    });
+    syncFullCatalog();
+  } else {
+    addLog('⏰ Skipped scheduled full import, previous job still running.', 'warning');
   }
 }, {
   timezone: 'Europe/London'
@@ -1178,10 +1128,10 @@ app.listen(PORT, () => {
   
   // Run initial inventory sync after 10 seconds
   setTimeout(() => {
-    addLog('🚀 Running initial inventory sync...', 'info');
-    syncInventory().catch(error => {
-      addLog(`Initial inventory sync failed: ${error.message}`, 'error');
-    });
+    if (!isRunning.inventory) {
+      addLog('🚀 Running initial inventory sync...', 'info');
+      syncInventory();
+    }
   }, 10000);
 });
 
@@ -1189,23 +1139,24 @@ app.listen(PORT, () => {
 // GRACEFUL SHUTDOWN
 // ============================================
 
-process.on('SIGTERM', () => {
-  addLog('Received SIGTERM, shutting down gracefully...', 'info');
-  process.exit(0);
-});
+function shutdown(signal) {
+    addLog(`Received ${signal}, shutting down gracefully...`, 'info');
+    // Here you could add logic to wait for running jobs to finish
+    process.exit(0);
+}
 
-process.on('SIGINT', () => {
-  addLog('Received SIGINT, shutting down gracefully...', 'info');
-  process.exit(0);
-});
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT', () => shutdown('SIGINT'));
 
 // Catch unhandled errors
 process.on('uncaughtException', (error) => {
   console.error('Uncaught Exception:', error);
-  addLog(`Uncaught Exception: ${error.message}`, 'error');
+  addLog(`FATAL Uncaught Exception: ${error.message}`, 'error');
+  // In a real app, you might want to restart, but for now we log and exit
+  // process.exit(1); 
 });
 
 process.on('unhandledRejection', (reason, promise) => {
   console.error('Unhandled Rejection at:', promise, 'reason:', reason);
-  addLog(`Unhandled Rejection: ${reason}`, 'error');
+  addLog(`FATAL Unhandled Rejection: ${reason}`, 'error');
 });
