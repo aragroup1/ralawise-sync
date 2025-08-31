@@ -127,7 +127,6 @@ app.get('/', (req, res) => {
     const isSystemLockedForActions = isSystemPaused || failsafe.isTriggered || confirmation.isAwaiting;
     const canTogglePause = !failsafe.isTriggered && !confirmation.isAwaiting;
 
-    // This check now safely handles the case where `confirmation.details` is an empty object `{}`
     const confirmationDetailsHTML = confirmation.details && confirmation.details.inventoryChange ? `<div class="confirmation-details"><div class="detail-grid"><div class="detail-card"><span class="detail-label">Threshold</span><span class="detail-value">${confirmation.details.inventoryChange.threshold}%</span></div><div class="detail-card"><span class="detail-label">Detected Change</span><span class="detail-value danger">${confirmation.details.inventoryChange.actualPercentage.toFixed(2)}%</span></div><div class="detail-card"><span class="detail-label">Updates Pending</span><span class="detail-value">${confirmation.details.inventoryChange.updatesNeeded}</span></div></div><div class="sample-changes"><h4>Sample Changes</h4><div class="changes-list">${confirmation.details.inventoryChange.sample.map(item => `<div class="change-item"><span class="sku">${item.sku}</span><span class="arrow">→</span><span class="qty-change">${item.oldQty} → ${item.newQty}</span></div>`).join('')}</div></div></div>` : '';
     
     const lastInventoryRun = runHistory.find(r => r.type === 'Inventory') || {};
@@ -245,10 +244,6 @@ app.post('/api/logs/clear', (req, res) => { logs = []; addLog('Logs cleared manu
 app.post('/api/failsafe/clear', (req, res) => { addLog('Failsafe manually cleared.', 'warning'); failsafe = { isTriggered: false, reason: '', timestamp: null, details: {} }; isRunning.inventory = false; isRunning.fullImport = false; notifyTelegram('✅ Failsafe has been manually cleared. Operations are resuming.'); res.json({ success: true }); });
 app.post('/api/pause/toggle', (req, res) => { isSystemPaused = !isSystemPaused; if (isSystemPaused) { fs.writeFileSync(PAUSE_LOCK_FILE, 'paused'); addLog('System has been MANUALLY PAUSED.', 'warning'); notifyTelegram('⏸️ System has been manually PAUSED.'); } else { try { fs.unlinkSync(PAUSE_LOCK_FILE); } catch (e) {} addLog('System has been RESUMED.', 'info'); notifyTelegram('▶️ System has been manually RESUMED.'); } res.json({ success: true, isPaused: isSystemPaused }); });
 
-// ====================================================================================
-// FIX: Corrected the race condition crash after handling a confirmation.
-// We now reset the confirmation object to its full, default state.
-// ====================================================================================
 function resetConfirmationState() {
     confirmation = { isAwaiting: false, message: '', details: {}, proceedAction: null, abortAction: null, jobKey: null };
 }
@@ -260,7 +255,7 @@ app.post('/api/confirmation/proceed', (req, res) => {
     notifyTelegram(`👍 User confirmed to PROCEED with: ${confirmation.message}`); 
     
     const actionToRun = confirmation.proceedAction;
-    resetConfirmationState(); // Reset state BEFORE responding and running action
+    resetConfirmationState(); 
     
     if (actionToRun) setTimeout(actionToRun, 0); 
     
@@ -273,7 +268,7 @@ app.post('/api/confirmation/abort', (req, res) => {
     const actionToRun = confirmation.abortAction;
     const jobKey = confirmation.jobKey;
 
-    resetConfirmationState(); // Reset state BEFORE responding and running action
+    resetConfirmationState();
     
     if (actionToRun) actionToRun(); 
     if (jobKey) isRunning[jobKey] = false; 
@@ -285,8 +280,24 @@ app.post('/api/confirmation/abort', (req, res) => {
 // SCHEDULED TASKS
 // ============================================
 
-cron.schedule('0 * * * *', () => { if (!isSystemPaused && !failsafe.isTriggered && !confirmation.isAwaiting && !isRunning.inventory) { addLog('⏰ Starting scheduled inventory sync...', 'info'); syncInventory(); } else { addLog('⏰ Skipped scheduled inventory sync: System is busy or paused.', 'warning'); } });
-cron.schedule('0 13 */2 * *', () => { if (!isSystemPaused && !failsafe.isTriggered && !confirmation.isAwaiting && !isRunning.fullImport) { addLog('⏰ Starting scheduled full catalog import...', 'info'); syncFullCatalog(); } else { addLog('⏰ Skipped scheduled full import: System is busy or paused.', 'warning'); } }, { timezone: 'Europe/London' });
+// MODIFICATION: Changed inventory sync schedule to once daily at 2:00 AM.
+cron.schedule('0 2 * * *', () => { 
+    if (!isSystemPaused && !failsafe.isTriggered && !confirmation.isAwaiting && !isRunning.inventory) { 
+        addLog('⏰ Starting scheduled inventory sync...', 'info'); 
+        syncInventory(); 
+    } else { 
+        addLog('⏰ Skipped scheduled inventory sync: System is busy or paused.', 'warning'); 
+    } 
+});
+
+cron.schedule('0 13 */2 * *', () => { 
+    if (!isSystemPaused && !failsafe.isTriggered && !confirmation.isAwaiting && !isRunning.fullImport) { 
+        addLog('⏰ Starting scheduled full catalog import...', 'info'); 
+        syncFullCatalog(); 
+    } else { 
+        addLog('⏰ Skipped scheduled full import: System is busy or paused.', 'warning'); 
+    } 
+}, { timezone: 'Europe/London' });
 
 // ============================================
 // SERVER STARTUP & SHUTDOWN
