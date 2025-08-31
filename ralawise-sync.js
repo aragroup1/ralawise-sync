@@ -997,4 +997,215 @@ app.get('/', (req, res) => {
           <button onclick="window.location.reload()">
             🔃 Refresh Dashboard
           </button>
-          
+          <p style="margin-top: 15px; color: #666; font-size: 14px;">
+            <strong>Automatic Schedule:</strong><br>
+            • Inventory sync: Every 60 minutes<br>
+            • Full catalog import: Every 2 days at 13:00 UK time
+          </p>
+        </div>
+        
+        <div class="card">
+          <h2>Activity Log</h2>
+          <div class="logs" id="logs">
+            ${logs.map(log => `
+              <div class="log-entry log-${log.type}">
+                [${new Date(log.timestamp).toLocaleTimeString()}] ${log.message}
+              </div>
+            `).join('')}
+            ${logs.length === 0 ? '<div class="log-entry">No logs yet. System just started.</div>' : ''}
+          </div>
+        </div>
+      </div>
+      
+      <script>
+        async function runInventorySync() {
+          if (!confirm('Run inventory sync now?')) return;
+          const btn = document.getElementById('invBtn');
+          btn.disabled = true;
+          btn.textContent = '⏳ Starting...';
+          try {
+            const res = await fetch('/api/sync/inventory', { method: 'POST' });
+            const data = await res.json();
+            if (data.error) {
+              alert('Error: ' + data.error);
+              btn.disabled = false;
+              btn.textContent = '🔄 Run Inventory Sync Now';
+            } else {
+              btn.textContent = '✅ Started!';
+              setTimeout(() => window.location.reload(), 2000);
+            }
+          } catch (e) {
+            alert('Failed to start sync: ' + e.message);
+            btn.disabled = false;
+            btn.textContent = '🔄 Run Inventory Sync Now';
+          }
+        }
+        
+        async function runFullImport() {
+          if (!confirm('This will create new products and mark discontinued ones as draft. Continue?')) return;
+          const btn = document.getElementById('fullBtn');
+          btn.disabled = true;
+          btn.textContent = '⏳ Starting...';
+          try {
+            const res = await fetch('/api/sync/full', { method: 'POST' });
+            const data = await res.json();
+            if (data.error) {
+              alert('Error: ' + data.error);
+              btn.disabled = false;
+              btn.textContent = '📦 Run Full Import Now';
+            } else {
+              btn.textContent = '✅ Started!';
+              setTimeout(() => window.location.reload(), 2000);
+            }
+          } catch (e) {
+            alert('Failed to start import: ' + e.message);
+            btn.disabled = false;
+            btn.textContent = '📦 Run Full Import Now';
+          }
+        }
+        
+        async function clearLogs() {
+          if (!confirm('Clear all logs?')) return;
+          await fetch('/api/logs/clear', { method: 'POST' });
+          window.location.reload();
+        }
+        
+        // Auto-refresh every 30 seconds if a job is running
+        const checkRefresh = () => {
+          const isRunning = ${isRunning.inventory || isRunning.fullImport};
+          if (isRunning) {
+            setTimeout(() => window.location.reload(), 30000);
+          } else {
+            setTimeout(() => window.location.reload(), 60000);
+          }
+        };
+        checkRefresh();
+      </script>
+    </body>
+    </html>
+  `;
+  res.send(html);
+});
+
+// ============================================
+// API ENDPOINTS
+// ============================================
+
+app.get('/api/status', (req, res) => {
+  res.json({
+    isRunning,
+    lastRun,
+    logs: logs.slice(0, 100),
+    config: {
+      shopifyDomain: config.shopify.domain,
+      ftpHost: config.ftp.host,
+      maxInventory: config.ralawise.maxInventory
+    }
+  });
+});
+
+app.post('/api/sync/inventory', async (req, res) => {
+  if (isRunning.inventory) {
+    return res.json({ error: 'Inventory sync already running' });
+  }
+  
+  // Run in background
+  syncInventory().catch(error => {
+    addLog(`Background inventory sync failed: ${error.message}`, 'error');
+  });
+  
+  res.json({ success: true, message: 'Inventory sync started' });
+});
+
+app.post('/api/sync/full', async (req, res) => {
+  if (isRunning.fullImport) {
+    return res.json({ error: 'Full import already running' });
+  }
+  
+  // Run in background
+  syncFullCatalog().catch(error => {
+    addLog(`Background full import failed: ${error.message}`, 'error');
+  });
+  
+  res.json({ success: true, message: 'Full import started' });
+});
+
+app.post('/api/logs/clear', (req, res) => {
+  logs = [];
+  addLog('Logs cleared', 'info');
+  res.json({ success: true });
+});
+
+// ============================================
+// SCHEDULED TASKS
+// ============================================
+
+// Inventory sync every 60 minutes
+cron.schedule('0 * * * *', () => {
+  if (!isRunning.inventory) {
+    addLog('⏰ Starting scheduled inventory sync...', 'info');
+    syncInventory().catch(error => {
+      addLog(`Scheduled inventory sync failed: ${error.message}`, 'error');
+    });
+  }
+});
+
+// Full import every 2 days at 13:00 UK time
+cron.schedule('0 13 */2 * *', () => {
+  if (!isRunning.fullImport) {
+    addLog('⏰ Starting scheduled full catalog import...', 'info');
+    syncFullCatalog().catch(error => {
+      addLog(`Scheduled full import failed: ${error.message}`, 'error');
+    });
+  }
+}, {
+  timezone: 'Europe/London'
+});
+
+// ============================================
+// SERVER STARTUP
+// ============================================
+
+const PORT = process.env.PORT || 3000;
+
+app.listen(PORT, () => {
+  addLog(`✅ Ralawise Sync Server started on port ${PORT}`, 'success');
+  addLog('📅 Inventory sync: Every 60 minutes', 'info');
+  addLog('📅 Full catalog import: Every 2 days at 13:00 UK time', 'info');
+  addLog(`🏪 Shopify domain: ${config.shopify.domain}`, 'info');
+  addLog(`📁 FTP host: ${config.ftp.host}`, 'info');
+  addLog(`📦 Max inventory cap: ${config.ralawise.maxInventory} units`, 'info');
+  
+  // Run initial inventory sync after 10 seconds
+  setTimeout(() => {
+    addLog('🚀 Running initial inventory sync...', 'info');
+    syncInventory().catch(error => {
+      addLog(`Initial inventory sync failed: ${error.message}`, 'error');
+    });
+  }, 10000);
+});
+
+// ============================================
+// GRACEFUL SHUTDOWN
+// ============================================
+
+process.on('SIGTERM', () => {
+  addLog('Received SIGTERM, shutting down gracefully...', 'info');
+  process.exit(0);
+});
+
+process.on('SIGINT', () => {
+  addLog('Received SIGINT, shutting down gracefully...', 'info');
+  process.exit(0);
+});
+
+// Catch unhandled errors
+process.on('uncaughtException', (error) => {
+  console.error('Uncaught Exception:', error);
+  addLog(`Uncaught Exception: ${error.message}`, 'error');
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('Unhandled Rejection at:', promise, 'reason:', reason);
+  addLog(`Unhandled Rejection: ${reason}`, 'error');
+});
