@@ -65,9 +65,6 @@ async function shopifyRequestWithRetry(method, url, data = null, retries = 3) { 
 async function fetchInventoryFromFTP() { const client = new ftp.Client(); client.ftp.verbose = false; try { addLog('Connecting to FTP...', 'info'); await client.access(config.ftp); const chunks = []; await client.downloadTo(new Writable({ write(c, e, cb) { chunks.push(c); cb(); } }), '/Stock/Stock_Update.csv'); const buffer = Buffer.concat(chunks); addLog(`FTP download successful, ${buffer.length} bytes`, 'success'); return Readable.from(buffer); } catch (e) { addLog(`FTP error: ${e.message}`, 'error'); throw e; } finally { client.close(); } }
 async function parseInventoryCSV(stream) { return new Promise((resolve, reject) => { const inventory = new Map(); stream.pipe(csv({ headers: ['SKU', 'Quantity'], skipLines: 1 })).on('data', row => { if (row.SKU && row.SKU !== 'SKU') inventory.set(row.SKU.trim(), Math.min(parseInt(row.Quantity) || 0, config.ralawise.maxInventory)); }).on('end', () => resolve(inventory)).on('error', reject); }); }
 
-// ====================================================================================
-// FIX #1: Corrected the infinite loop pagination issue.
-// ====================================================================================
 async function getAllShopifyProducts() {
     let allProducts = [];
     let pageCount = 0;
@@ -127,15 +124,12 @@ async function syncFullCatalog() { if (isSystemPaused || failsafe.isTriggered ||
 // ============================================
 
 app.get('/', (req, res) => {
-    // ====================================================================================
-    // FIX #2: Corrected the pause lockout bug.
-    // The "Pause/Resume" button should not be disabled just because the system is paused.
-    // It should only be disabled in more critical states (failsafe/confirmation).
-    // ====================================================================================
     const isSystemLockedForActions = isSystemPaused || failsafe.isTriggered || confirmation.isAwaiting;
     const canTogglePause = !failsafe.isTriggered && !confirmation.isAwaiting;
 
-    const confirmationDetailsHTML = confirmation.details.inventoryChange ? `<div class="confirmation-details"><div class="detail-grid"><div class="detail-card"><span class="detail-label">Threshold</span><span class="detail-value">${confirmation.details.inventoryChange.threshold}%</span></div><div class="detail-card"><span class="detail-label">Detected Change</span><span class="detail-value danger">${confirmation.details.inventoryChange.actualPercentage.toFixed(2)}%</span></div><div class="detail-card"><span class="detail-label">Updates Pending</span><span class="detail-value">${confirmation.details.inventoryChange.updatesNeeded}</span></div></div><div class="sample-changes"><h4>Sample Changes</h4><div class="changes-list">${confirmation.details.inventoryChange.sample.map(item => `<div class="change-item"><span class="sku">${item.sku}</span><span class="arrow">→</span><span class="qty-change">${item.oldQty} → ${item.newQty}</span></div>`).join('')}</div></div></div>` : '';
+    // This check now safely handles the case where `confirmation.details` is an empty object `{}`
+    const confirmationDetailsHTML = confirmation.details && confirmation.details.inventoryChange ? `<div class="confirmation-details"><div class="detail-grid"><div class="detail-card"><span class="detail-label">Threshold</span><span class="detail-value">${confirmation.details.inventoryChange.threshold}%</span></div><div class="detail-card"><span class="detail-label">Detected Change</span><span class="detail-value danger">${confirmation.details.inventoryChange.actualPercentage.toFixed(2)}%</span></div><div class="detail-card"><span class="detail-label">Updates Pending</span><span class="detail-value">${confirmation.details.inventoryChange.updatesNeeded}</span></div></div><div class="sample-changes"><h4>Sample Changes</h4><div class="changes-list">${confirmation.details.inventoryChange.sample.map(item => `<div class="change-item"><span class="sku">${item.sku}</span><span class="arrow">→</span><span class="qty-change">${item.oldQty} → ${item.newQty}</span></div>`).join('')}</div></div></div>` : '';
+    
     const lastInventoryRun = runHistory.find(r => r.type === 'Inventory') || {};
     const lastFullImportRun = runHistory.find(r => r.type === 'Full Import') || {};
     const last24h = runHistory.filter(r => new Date(r.timestamp) > new Date(Date.now() - 24*60*60*1000));
@@ -250,8 +244,42 @@ app.post('/api/sync/full', async (req, res) => { if (isSystemPaused) return res.
 app.post('/api/logs/clear', (req, res) => { logs = []; addLog('Logs cleared manually', 'info'); res.json({ success: true }); });
 app.post('/api/failsafe/clear', (req, res) => { addLog('Failsafe manually cleared.', 'warning'); failsafe = { isTriggered: false, reason: '', timestamp: null, details: {} }; isRunning.inventory = false; isRunning.fullImport = false; notifyTelegram('✅ Failsafe has been manually cleared. Operations are resuming.'); res.json({ success: true }); });
 app.post('/api/pause/toggle', (req, res) => { isSystemPaused = !isSystemPaused; if (isSystemPaused) { fs.writeFileSync(PAUSE_LOCK_FILE, 'paused'); addLog('System has been MANUALLY PAUSED.', 'warning'); notifyTelegram('⏸️ System has been manually PAUSED.'); } else { try { fs.unlinkSync(PAUSE_LOCK_FILE); } catch (e) {} addLog('System has been RESUMED.', 'info'); notifyTelegram('▶️ System has been manually RESUMED.'); } res.json({ success: true, isPaused: isSystemPaused }); });
-app.post('/api/confirmation/proceed', (req, res) => { if (!confirmation.isAwaiting) return res.status(400).json({ success: false, error: 'No confirmation pending.' }); addLog(`User confirmed to PROCEED with: ${confirmation.message}`, 'info'); notifyTelegram(`👍 User confirmed to PROCEED with: ${confirmation.message}`); if (confirmation.proceedAction) setTimeout(confirmation.proceedAction, 0); confirmation = { isAwaiting: false }; res.json({ success: true, message: 'Action proceeding.' }); });
-app.post('/api/confirmation/abort', (req, res) => { if (!confirmation.isAwaiting) return res.status(400).json({ success: false, error: 'No confirmation pending.' }); if (confirmation.abortAction) confirmation.abortAction(); const jobKey = confirmation.jobKey; if (jobKey) isRunning[jobKey] = false; confirmation = { isAwaiting: false }; res.json({ success: true, message: 'Action aborted and system paused.' }); });
+
+// ====================================================================================
+// FIX: Corrected the race condition crash after handling a confirmation.
+// We now reset the confirmation object to its full, default state.
+// ====================================================================================
+function resetConfirmationState() {
+    confirmation = { isAwaiting: false, message: '', details: {}, proceedAction: null, abortAction: null, jobKey: null };
+}
+
+app.post('/api/confirmation/proceed', (req, res) => { 
+    if (!confirmation.isAwaiting) return res.status(400).json({ success: false, error: 'No confirmation pending.' }); 
+    
+    addLog(`User confirmed to PROCEED with: ${confirmation.message}`, 'info'); 
+    notifyTelegram(`👍 User confirmed to PROCEED with: ${confirmation.message}`); 
+    
+    const actionToRun = confirmation.proceedAction;
+    resetConfirmationState(); // Reset state BEFORE responding and running action
+    
+    if (actionToRun) setTimeout(actionToRun, 0); 
+    
+    res.json({ success: true, message: 'Action proceeding.' }); 
+});
+
+app.post('/api/confirmation/abort', (req, res) => { 
+    if (!confirmation.isAwaiting) return res.status(400).json({ success: false, error: 'No confirmation pending.' }); 
+    
+    const actionToRun = confirmation.abortAction;
+    const jobKey = confirmation.jobKey;
+
+    resetConfirmationState(); // Reset state BEFORE responding and running action
+    
+    if (actionToRun) actionToRun(); 
+    if (jobKey) isRunning[jobKey] = false; 
+    
+    res.json({ success: true, message: 'Action aborted and system paused.' }); 
+});
 
 // ============================================
 // SCHEDULED TASKS
