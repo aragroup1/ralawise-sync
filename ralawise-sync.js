@@ -17,26 +17,7 @@ app.use(express.json());
 // ============================================
 
 const config = {
-  shopify: {
-    domain: process.env.SHOPIFY_DOMAIN,
-    accessToken: process.env.SHOPIFY_ACCESS_TOKEN,
-    locationId: process.env.SHOPIFY_LOCATION_ID,
-    baseUrl: `https://${process.env.SHOPIFY_DOMAIN}/admin/api/2024-01`
-  },
-  ftp: {
-    host: process.env.FTP_HOST,
-    user: process.env.FTP_USERNAME,
-    password: process.env.FTP_PASSWORD,
-    secure: false
-  },
-  ralawise: {
-    zipUrl: process.env.RALAWISE_ZIP_URL,
-    maxInventory: parseInt(process.env.MAX_INVENTORY || '20')
-  },
-  telegram: {
-    botToken: process.env.TELEGRAM_BOT_TOKEN,
-    chatId: process.env.TELEGRAM_CHAT_ID
-  },
+  
   // --- NEW: Failsafe Configuration ---
   failsafe: {
     inventoryChangePercentage: parseInt(process.env.FAILSAFE_INVENTORY_CHANGE_PERCENTAGE || '10')
