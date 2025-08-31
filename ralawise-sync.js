@@ -59,84 +59,7 @@ const shopifyClient = axios.create({ baseURL: config.shopify.baseUrl, headers: {
 async function fetchInventoryFromFTP() { const client = new ftp.Client(); client.ftp.verbose = false; try { addLog('Connecting to FTP...', 'info'); await client.access(config.ftp); const chunks = []; await client.downloadTo(new Writable({ write(c, e, cb) { chunks.push(c); cb(); } }), '/Stock/Stock_Update.csv'); const buffer = Buffer.concat(chunks); addLog(`FTP download successful, ${buffer.length} bytes`, 'success'); return Readable.from(buffer); } catch (e) { addLog(`FTP error: ${e.message}`, 'error'); throw e; } finally { client.close(); } }
 async function parseInventoryCSV(stream) { return new Promise((resolve, reject) => { const inventory = new Map(); stream.pipe(csv({ headers: ['SKU', 'Quantity'], skipLines: 1 })).on('data', row => { if (row.SKU && row.SKU !== 'SKU') inventory.set(row.SKU.trim(), Math.min(parseInt(row.Quantity) || 0, config.ralawise.maxInventory)); }).on('end', () => resolve(inventory)).on('error', reject); }); }
 async function getAllShopifyProducts() { let all = []; let url = `/products.json?limit=250&fields=id,handle,title,variants,tags,status`; while (url) { const res = await shopifyClient.get(url); all.push(...res.data.products); const link = res.headers.link; url = link && link.includes('rel="next"') ? link.match(/<([^>]+)>/)[1].replace(config.shopify.baseUrl, '') : null; await delay(250); } addLog(`Fetched ${all.length} products from Shopify`, 'success'); return all; }
-
-// --- THIS IS THE CORRECTED SECTION ---
-async function updateInventoryBySKU(inventoryMap) {
-    if (isRunning.inventory) { addLog('Inventory update already running.', 'warning'); return; }
-    isRunning.inventory = true;
-    try {
-        addLog('=== STARTING INVENTORY ANALYSIS ===', 'info');
-        const shopifyProducts = await getAllShopifyProducts();
-        const skuToProduct = new Map();
-        shopifyProducts.forEach(p => p.variants?.forEach(v => { if (v.sku) skuToProduct.set(v.sku.toUpperCase(), { product: p, variant: v }); }));
-        
-        const updatesToPerform = [];
-        inventoryMap.forEach((newQty, sku) => {
-            const match = skuToProduct.get(sku.toUpperCase());
-            if (match && (match.variant.inventory_quantity || 0) !== newQty) {
-                updatesToPerform.push({ sku, oldQty: match.variant.inventory_quantity || 0, newQty, match });
-            }
-        });
-        const totalProducts = skuToProduct.size;
-        const updatesNeeded = updatesToPerform.length;
-        const changePercentage = totalProducts > 0 ? (updatesNeeded / totalProducts) * 100 : 0;
-        addLog(`Change analysis: ${updatesNeeded} updates for ${totalProducts} products (${changePercentage.toFixed(2)}%)`, 'info');
-
-        const executeUpdates = async () => {
-            let updated = 0, errors = 0, tagged = 0;
-            addLog(`Executing updates for ${updatesNeeded} products...`, 'info');
-            for (const u of updatesToPerform) {
-                try {
-                    if (!u.match.product.tags?.includes('Supplier:Ralawise')) {
-                        await shopifyClient.put(`/products/${u.match.product.id}.json`, { product: { id: u.match.product.id, tags: `${u.match.product.tags || ''},Supplier:Ralawise`.replace(/^,/, '') } });
-                        tagged++;
-                        await delay(200);
-                    }
-                    if (!u.match.variant.inventory_management) {
-                        await shopifyClient.put(`/variants/${u.match.variant.id}.json`, { variant: { id: u.match.variant.id, inventory_management: 'shopify', inventory_policy: 'deny' } });
-                        await delay(200);
-                    }
-                    await shopifyClient.post('/inventory_levels/connect.json', { location_id: config.shopify.locationId, inventory_item_id: u.match.variant.inventory_item_id }).catch(() => {});
-                    await shopifyClient.post('/inventory_levels/set.json', { location_id: config.shopify.locationId, inventory_item_id: u.match.variant.inventory_item_id, available: u.newQty });
-                    updated++;
-                    addLog(`Updated ${u.match.product.title} (${u.sku}): ${u.oldQty} → ${u.newQty}`, 'success');
-                    await delay(250);
-                } catch (e) {
-                    errors++;
-                    addLog(`Failed to update ${u.sku}: ${e.response ? JSON.stringify(e.response.data) : e.message}`, 'error');
-                    if (e.response?.status === 429) await delay(5000);
-                }
-            }
-            const notFound = inventoryMap.size - updatesToPerform.length;
-            lastRun.inventory = { updated, errors, tagged, timestamp: new Date().toISOString() };
-            notifyTelegram(`Inventory update complete:\n✅ ${updated} updated, 🏷️ ${tagged} tagged, ❌ ${errors} errors, ❓ ${notFound} not found`);
-        };
-        
-        // ** THIS IS THE CRITICAL FIX **
-        // Instead of triggerFailsafe, we now call requestConfirmation
-        if (changePercentage > config.failsafe.inventoryChangePercentage) {
-            requestConfirmation(
-                'inventory',
-                `High inventory change detected`,
-                { inventoryChange: { threshold: config.failsafe.inventoryChangePercentage, actualPercentage: changePercentage, updatesNeeded, totalProducts, sample: updatesToPerform.slice(0, 10).map(u => ({ sku: u.sku, oldQty: u.oldQty, newQty: u.newQty })) }},
-                async () => {
-                    try { await executeUpdates(); } 
-                    finally { isRunning.inventory = false; }
-                }
-            );
-            return; // Exit and wait for user action
-        } else {
-            // Proceed automatically if under threshold
-            await executeUpdates();
-        }
-    } catch (error) {
-        triggerFailsafe(`Inventory update failed critically: ${error.message}`);
-    } finally {
-        if (!confirmation.isAwaiting || confirmation.jobKey !== 'inventory') {
-            isRunning.inventory = false;
-        }
-    }
-}
+async function updateInventoryBySKU(inventoryMap) { if (isRunning.inventory) { addLog('Inventory update already running.', 'warning'); return; } isRunning.inventory = true; try { addLog('=== STARTING INVENTORY ANALYSIS ===', 'info'); const shopifyProducts = await getAllShopifyProducts(); const skuToProduct = new Map(); shopifyProducts.forEach(p => p.variants?.forEach(v => { if (v.sku) skuToProduct.set(v.sku.toUpperCase(), { product: p, variant: v }); })); const updatesToPerform = []; inventoryMap.forEach((newQty, sku) => { const match = skuToProduct.get(sku.toUpperCase()); if (match && (match.variant.inventory_quantity || 0) !== newQty) updatesToPerform.push({ sku, oldQty: match.variant.inventory_quantity || 0, newQty, match }); }); const totalProducts = skuToProduct.size; const updatesNeeded = updatesToPerform.length; const changePercentage = totalProducts > 0 ? (updatesNeeded / totalProducts) * 100 : 0; addLog(`Change analysis: ${updatesNeeded} updates for ${totalProducts} products (${changePercentage.toFixed(2)}%)`, 'info'); const executeUpdates = async () => { let updated = 0, errors = 0, tagged = 0; addLog(`Executing updates for ${updatesNeeded} products...`, 'info'); for (const u of updatesToPerform) { try { if (!u.match.product.tags?.includes('Supplier:Ralawise')) { await shopifyClient.put(`/products/${u.match.product.id}.json`, { product: { id: u.match.product.id, tags: `${u.match.product.tags || ''},Supplier:Ralawise`.replace(/^,/, '') } }); tagged++; await delay(200); } if (!u.match.variant.inventory_management) { await shopifyClient.put(`/variants/${u.match.variant.id}.json`, { variant: { id: u.match.variant.id, inventory_management: 'shopify', inventory_policy: 'deny' } }); await delay(200); } await shopifyClient.post('/inventory_levels/connect.json', { location_id: config.shopify.locationId, inventory_item_id: u.match.variant.inventory_item_id }).catch(() => {}); await shopifyClient.post('/inventory_levels/set.json', { location_id: config.shopify.locationId, inventory_item_id: u.match.variant.inventory_item_id, available: u.newQty }); updated++; addLog(`Updated ${u.match.product.title} (${u.sku}): ${u.oldQty} → ${u.newQty}`, 'success'); await delay(250); } catch (e) { errors++; addLog(`Failed to update ${u.sku}: ${e.response ? JSON.stringify(e.response.data) : e.message}`, 'error'); if (e.response?.status === 429) await delay(5000); } } const notFound = inventoryMap.size - updatesToPerform.length; lastRun.inventory = { updated, errors, tagged, timestamp: new Date().toISOString() }; notifyTelegram(`Inventory update complete:\n✅ ${updated} updated, 🏷️ ${tagged} tagged, ❌ ${errors} errors, ❓ ${notFound} not found`); }; if (changePercentage > config.failsafe.inventoryChangePercentage) { requestConfirmation('inventory', `High inventory change detected`, { inventoryChange: { threshold: config.failsafe.inventoryChangePercentage, actualPercentage: changePercentage, updatesNeeded, totalProducts, sample: updatesToPerform.slice(0, 10).map(u => ({ sku: u.sku, oldQty: u.oldQty, newQty: u.newQty })) }}, async () => { try { await executeUpdates(); } finally { isRunning.inventory = false; } }); return; } else { await executeUpdates(); } } catch (error) { triggerFailsafe(`Inventory update failed critically: ${error.message}`); } finally { if (!confirmation.isAwaiting || confirmation.jobKey !== 'inventory') isRunning.inventory = false; } }
 async function downloadAndExtractZip() { const url = `${config.ralawise.zipUrl}?t=${Date.now()}`; addLog(`Downloading zip: ${url}`, 'info'); const res = await axios.get(url, { responseType: 'arraybuffer', timeout: 120000 }); const tempDir = path.join(__dirname, 'temp', `ralawise_${Date.now()}`); fs.mkdirSync(tempDir, { recursive: true }); const zipPath = path.join(tempDir, 'data.zip'); fs.writeFileSync(zipPath, res.data); const zip = new AdmZip(zipPath); zip.extractAllTo(tempDir, true); fs.unlinkSync(zipPath); return { tempDir, csvFiles: fs.readdirSync(tempDir).filter(f => f.endsWith('.csv')).map(f => path.join(tempDir, f)) }; }
 async function parseShopifyCSV(filePath) { return new Promise((resolve, reject) => { const products = []; fs.createReadStream(filePath).pipe(csv()).on('data', row => { products.push({ ...row, price: applyRalawisePricing(parseFloat(row['Variant Price']) || 0), original_price: parseFloat(row['Variant Price']) || 0 }); }).on('end', () => resolve(products)).on('error', reject); }); }
 async function processFullImport(csvFiles) { if (isRunning.fullImport) return; isRunning.fullImport = true; let created = 0, discontinued = 0, errors = 0; try { addLog('=== STARTING FULL IMPORT ===', 'info'); const allRows = (await Promise.all(csvFiles.map(parseShopifyCSV))).flat(); const productsByHandle = new Map(); for (const row of allRows) { if (!row.Handle) continue; if (!productsByHandle.has(row.Handle)) productsByHandle.set(row.Handle, { ...row, tags: `${row.Tags || ''},Supplier:Ralawise`.replace(/^,/, ''), images: [], variants: [], options: [] }); const p = productsByHandle.get(row.Handle); if (row['Image Src'] && !p.images.some(img => img.src === row['Image Src'])) p.images.push({ src: row['Image Src'], position: parseInt(row['Image Position']), alt: row['Image Alt Text'] || row.Title }); if (row['Variant SKU']) { const v = { sku: row['Variant SKU'], price: row.price, option1: row['Option1 Value'], option2: row['Option2 Value'], option3: row['Option3 Value'], inventory_quantity: Math.min(parseInt(row['Variant Inventory Qty']) || 0, config.ralawise.maxInventory) }; p.variants.push(v); } } const shopifyProducts = await getAllShopifyProducts(); const existingHandles = new Set(shopifyProducts.filter(p => p.tags?.includes('Supplier:Ralawise')).map(p => p.handle)); const toCreate = Array.from(productsByHandle.values()).filter(p => !existingHandles.has(p.Handle)); addLog(`Found ${toCreate.length} new products to create.`, 'info'); for (const p of toCreate.slice(0, 30)) { try { const res = await shopifyClient.post('/products.json', { product: { title: p.Title, handle: p.Handle, body_html: p['Body (HTML)'], vendor: p.Vendor, product_type: p.Type, tags: p.tags, images: p.images, variants: p.variants.map(v => ({...v, inventory_management: 'shopify', inventory_policy: 'deny'})) } }); for (const v of res.data.product.variants) { const origV = p.variants.find(ov => ov.sku === v.sku); if (origV && v.inventory_item_id && origV.inventory_quantity > 0) { await shopifyClient.post('/inventory_levels/connect.json', { location_id: config.shopify.locationId, inventory_item_id: v.inventory_item_id }).catch(()=>{}); await shopifyClient.post('/inventory_levels/set.json', { location_id: config.shopify.locationId, inventory_item_id: v.inventory_item_id, available: origV.inventory_quantity }); } } created++; addLog(`✅ Created: ${p.Title}`, 'success'); await delay(1000); } catch(e) { errors++; addLog(`❌ Failed to create ${p.Title}: ${e.message}`, 'error'); } } const newHandles = new Set(Array.from(productsByHandle.keys())); const toDiscontinue = shopifyProducts.filter(p => p.tags?.includes('Supplier:Ralawise') && !newHandles.has(p.handle)); addLog(`Found ${toDiscontinue.length} products to discontinue.`, 'info'); for (const p of toDiscontinue.slice(0, 50)) { try { await shopifyClient.put(`/products/${p.id}.json`, { product: { id: p.id, status: 'draft' } }); for (const v of p.variants) { if (v.inventory_item_id) await shopifyClient.post('/inventory_levels/set.json', { location_id: config.shopify.locationId, inventory_item_id: v.inventory_item_id, available: 0 }).catch(()=>{}); } discontinued++; addLog(`⏸️ Discontinued: ${p.title}`, 'info'); await delay(500); } catch(e) { errors++; addLog(`Failed to discontinue ${p.title}: ${e.message}`, 'error'); } } lastRun.fullImport = { created, discontinued, errors, timestamp: new Date().toISOString() }; notifyTelegram(`Full import complete:\n✅ ${created} created\n⏸️ ${discontinued} discontinued\n❌ ${errors} errors`); } catch(e) { triggerFailsafe(`Full import failed: ${e.message}`); } finally { isRunning.fullImport = false; } }
@@ -154,25 +77,143 @@ async function syncFullCatalog() { if (isSystemPaused || failsafe.isTriggered ||
 
 app.get('/', (req, res) => {
     const isSystemLocked = isSystemPaused || failsafe.isTriggered || confirmation.isAwaiting;
-    const confirmationDetailsHTML = confirmation.details.inventoryChange ? `<div class="stats"><div class="stat"><h3>Threshold</h3><p>${confirmation.details.inventoryChange.threshold}%</p></div><div class="stat"><h3>Detected Change</h3><p>${confirmation.details.inventoryChange.actualPercentage.toFixed(2)}%</p></div><div class="stat"><h3>Updates Pending</h3><p>${confirmation.details.inventoryChange.updatesNeeded}</p></div><div class="stat" style="grid-column: 1 / -1;"><h3>Sample Changes (SKU: Old -> New)</h3><pre style="text-align: left; background: #eee; padding: 10px; border-radius: 5px; color: #333; max-height: 150px; overflow-y: auto;">${confirmation.details.inventoryChange.sample.map(item => `${item.sku}: ${item.oldQty} -> ${item.newQty}`).join('\n')}</pre></div></div>` : '';
-    const html = `<!DOCTYPE html><html><head><title>Ralawise Sync Dashboard</title><meta name="viewport" content="width=device-width, initial-scale=1"><style>*{margin:0;padding:0;box-sizing:border-box}body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#f4f7f6;min-height:100vh;padding:20px}.container{max-width:1200px;margin:0 auto}h1{color:#333;text-align:center;margin-bottom:30px;font-size:2.5em}.card{background:white;border-radius:12px;padding:25px;margin-bottom:20px;box-shadow:0 4px 6px rgba(0,0,0,.1)}.card h2{color:#333;margin-bottom:20px;border-bottom:2px solid #eee;padding-bottom:10px}.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:20px}.stat{background:#f9f9f9;border:1px solid #eee;padding:20px;border-radius:8px;text-align:center}.stat h3{font-size:14px;color:#666;margin-bottom:10px;text-transform:uppercase}.stat p{font-size:32px;font-weight:700;color:#333}.stat small{display:block;margin-top:10px;color:#888;font-size:12px}button{color:#fff;border:none;padding:12px 24px;border-radius:8px;cursor:pointer;font-size:16px;margin-right:10px;margin-bottom:10px;transition:background-color .2s;font-weight:600}button:hover{opacity:.9}button:disabled{background:#ccc!important;cursor:not-allowed}.btn-action{background:#3498db}.btn-pause{background:#e67e22}.btn-resume{background:#2ecc71}.btn-proceed{background:#27ae60}.btn-abort{background:#c0392b}.logs{background:#1e1e1e;color:#fff;padding:20px;border-radius:8px;max-height:400px;overflow-y:auto;font-family:'Courier New',monospace;font-size:13px;line-height:1.5}.log-entry{margin-bottom:8px;padding:4px 0;border-bottom:1px solid rgba(255,255,255,.1)}.log-info{color:#58a6ff}.log-success{color:#56d364}.log-warning{color:#f0ad4e}.log-error{color:#f85149}.status-badge{display:inline-block;padding:8px 16px;border-radius:20px;font-size:14px;font-weight:700;text-transform:uppercase}.status-idle{background:#2ecc71;color:#fff}.status-running{background:#f1c40f;color:#333;animation:pulse 2s infinite}@keyframes pulse{0%{opacity:1}50%{opacity:.6}100%{opacity:1}}.banner{color:#fff;padding:20px;border-radius:12px;margin-bottom:20px;box-shadow:0 4px 6px rgba(0,0,0,.1)}.banner h2{border-bottom-color:rgba(255,255,255,.3)}.failsafe-banner{background:#e74c3c}.confirmation-banner{background:#3498db}</style></head><body><div class="container"><h1>🏪 Ralawise Sync Dashboard</h1>
-    ${failsafe.isTriggered ? `<div class="banner failsafe-banner"><h2>🚨 Failsafe Active</h2><p style="margin-bottom:20px"><strong>Reason:</strong> ${failsafe.reason}</p><button onclick="clearFailsafe()">✅ Clear Failsafe</button></div>` : ''}
-    ${confirmation.isAwaiting ? `<div class="banner confirmation-banner"><h2>🤔 Confirmation Required</h2><p style="margin-bottom:20px"><strong>Action Paused:</strong> ${confirmation.message}</p>${confirmationDetailsHTML}<button onclick="proceed()" class="btn-proceed">👍 Proceed Anyway</button><button onclick="abort()" class="btn-abort">🚫 Abort & Pause System</button></div>` : ''}
-    <div class="card"><h2>System Status</h2><div class="stats"><div class="stat"><h3>Overall Status</h3><p class="status-badge" style="background:${isSystemPaused ? '#e67e22' : '#2ecc71'};color:#fff">${isSystemPaused ? 'Paused' : 'Active'}</p></div><div class="stat"><h3>Inventory Sync</h3><p class="status-badge ${isRunning.inventory ? 'status-running' : 'status-idle'}">${isRunning.inventory ? 'Running' : 'Idle'}</p></div><div class="stat"><h3>Full Import</h3><p class="status-badge ${isRunning.fullImport ? 'status-running' : 'status-idle'}">${isRunning.fullImport ? 'Running' : 'Idle'}</p></div></div></div>
-    <div class="card"><h2>Manual Controls</h2><button onclick="togglePause()" class="${isSystemPaused ? 'btn-resume' : 'btn-pause'}" ${isSystemLocked ? 'disabled' : ''}>${isSystemPaused ? '▶️ Resume System' : '⏸️ Pause System'}</button><button onclick="runInventorySync()" class="btn-action" ${isSystemLocked ? 'disabled' : ''}>🔄 Run Inventory Sync</button><button onclick="runFullImport()" class="btn-action" ${isSystemLocked ? 'disabled' : ''}>📦 Run Full Import</button><button onclick="clearLogs()" class="btn-action" ${isSystemLocked ? 'disabled' : ''}>🗑️ Clear Logs</button></div>
-    <div class="card"><h2>Last Run Statistics</h2><div class="stats"><div class="stat"><h3>Inventory Updated</h3><p>${lastRun.inventory.updated || 0}</p><small>${lastRun.inventory.timestamp ? new Date(lastRun.inventory.timestamp).toLocaleString() : 'Never'}</small></div><div class="stat"><h3>Products Tagged</h3><p>${lastRun.inventory.tagged || 0}</p><small>With Supplier:Ralawise</small></div><div class="stat"><h3>Products Created</h3><p>${lastRun.fullImport.created || 0}</p><small>${lastRun.fullImport.timestamp ? new Date(lastRun.fullImport.timestamp).toLocaleString() : 'Never'}</small></div><div class="stat"><h3>Discontinued</h3><p>${lastRun.fullImport.discontinued || 0}</p><small>Marked as draft</small></div></div></div>
-    <div class="card"><h2>Activity Log</h2><div class="logs" id="logs">${logs.map(log => `<div class="log-entry log-${log.type}">[${new Date(log.timestamp).toLocaleTimeString()}] ${log.message}</div>`).join('')}</div></div>
-    </div><script>
-    async function apiPost(endpoint, confirmMsg) { if (confirmMsg && !confirm(confirmMsg)) return; const btn = event.target; btn.disabled = true; try { await fetch(endpoint, { method: 'POST' }); window.location.reload(); } catch (e) { alert('Failed: ' + e.message); btn.disabled = false; } }
-    function runInventorySync() { apiPost('/api/sync/inventory', 'Run inventory sync now?'); }
-    function runFullImport() { apiPost('/api/sync/full', 'Create new products and mark discontinued ones?'); }
-    function togglePause() { apiPost('/api/pause/toggle'); }
-    function clearFailsafe() { apiPost('/api/failsafe/clear', 'Clear failsafe and resume operations?'); }
-    function clearLogs() { apiPost('/api/logs/clear', 'Clear all logs?'); }
-    function proceed() { apiPost('/api/confirmation/proceed', 'Proceed with the pending action?'); }
-    function abort() { apiPost('/api/confirmation/abort', 'Abort the action and pause the system?'); }
-    setTimeout(() => window.location.reload(), 30000);
-    </script></body></html>`;
+    const confirmationDetailsHTML = confirmation.details.inventoryChange ? `<div class="stats"><div class="stat"><h3>Threshold</h3><p>${confirmation.details.inventoryChange.threshold}%</p></div><div class="stat"><h3>Detected Change</h3><p>${confirmation.details.inventoryChange.actualPercentage.toFixed(2)}%</p></div><div class="stat"><h3>Updates Pending</h3><p>${confirmation.details.inventoryChange.updatesNeeded}</p></div><div class="stat full-width"><h3>Sample Changes (SKU: Old -> New)</h3><pre>${confirmation.details.inventoryChange.sample.map(item => `${item.sku}: ${item.oldQty} -> ${item.newQty}`).join('\n')}</pre></div></div>` : '';
+    const html = `<!DOCTYPE html>
+    <html>
+    <head>
+        <title>Ralawise Sync Dashboard</title>
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <link rel="preconnect" href="https://fonts.googleapis.com">
+        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+        <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
+        <style>
+            :root {
+                --bg-color: #121212;
+                --card-bg: rgba(38, 38, 38, 0.7);
+                --text-color: #EAEAEA;
+                --text-muted: #A0A0A0;
+                --border-color: rgba(255, 255, 255, 0.1);
+                --primary-gradient: linear-gradient(90deg, #8E2DE2 0%, #4A00E0 100%);
+                --green-gradient: linear-gradient(90deg, #11998e 0%, #38ef7d 100%);
+                --amber-gradient: linear-gradient(90deg, #FFC107 0%, #FF8F00 100%);
+                --red-gradient: linear-gradient(90deg, #cb2d3e 0%, #ef473a 100%);
+            }
+            * { margin: 0; padding: 0; box-sizing: border-box; }
+            body { 
+                font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+                background-color: var(--bg-color);
+                color: var(--text-color);
+                min-height: 100vh;
+                padding: 2rem;
+                background-image: radial-gradient(circle at top right, rgba(74, 0, 224, 0.2) 0%, transparent 40%),
+                                  radial-gradient(circle at bottom left, rgba(142, 45, 226, 0.2) 0%, transparent 50%);
+            }
+            .container { max-width: 1200px; margin: 0 auto; display: grid; gap: 2rem; }
+            .header { text-align: center; margin-bottom: 1rem; }
+            .header h1 { font-size: 2.5rem; font-weight: 700; letter-spacing: -1px; }
+            .header p { color: var(--text-muted); font-size: 1.1rem; }
+            .card {
+                background: var(--card-bg);
+                border: 1px solid var(--border-color);
+                border-radius: 16px;
+                padding: 2rem;
+                backdrop-filter: blur(20px);
+                -webkit-backdrop-filter: blur(20px);
+                box-shadow: 0 8px 32px rgba(0,0,0,0.2);
+            }
+            .card h2 { margin-bottom: 1.5rem; border-bottom: 1px solid var(--border-color); padding-bottom: 1rem; font-weight: 600; }
+            .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 1.5rem; }
+            .stat { background: rgba(0,0,0,0.2); border-radius: 12px; padding: 1.5rem; text-align: center; }
+            .stat h3 { font-size: 0.9rem; color: var(--text-muted); margin-bottom: 0.75rem; text-transform: uppercase; letter-spacing: 0.5px; }
+            .stat p { font-size: 2.5rem; font-weight: 700; line-height: 1; }
+            .stat small { display: block; margin-top: 0.75rem; color: var(--text-muted); font-size: 0.8rem; }
+            .stat.full-width { grid-column: 1 / -1; }
+            .stat pre { text-align: left; background: var(--bg-color); padding: 1rem; border-radius: 8px; color: var(--text-muted); max-height: 150px; overflow-y: auto; font-family: 'SF Mono', 'Fira Code', monospace; font-size: 0.8rem; }
+            
+            button { color: #fff; border: none; padding: 0.8rem 1.5rem; border-radius: 8px; cursor: pointer; font-size: 1rem; font-weight: 600; transition: all 0.2s ease; background-size: 200% auto; }
+            button:hover { transform: translateY(-2px); box-shadow: 0 4px 15px rgba(0,0,0,0.2); }
+            button:disabled { background-image: none !important; background-color: #444 !important; color: #888; cursor: not-allowed; transform: none; box-shadow: none; }
+            
+            .btn-group { display: flex; flex-wrap: wrap; gap: 1rem; }
+            .btn-action { background-image: var(--primary-gradient); }
+            .btn-pause { background-image: var(--amber-gradient); }
+            .btn-resume { background-image: var(--green-gradient); }
+            .btn-proceed { background-image: var(--green-gradient); }
+            .btn-abort { background-image: var(--red-gradient); }
+
+            .logs { background: rgba(0,0,0,0.3); padding: 1.5rem; border-radius: 12px; max-height: 400px; overflow-y: auto; font-family: 'SF Mono', 'Fira Code', monospace; font-size: 0.85rem; line-height: 1.6; }
+            .logs::-webkit-scrollbar { width: 8px; }
+            .logs::-webkit-scrollbar-track { background: transparent; }
+            .logs::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.2); border-radius: 4px; }
+            .log-entry { margin-bottom: 0.5rem; padding-bottom: 0.5rem; border-bottom: 1px solid var(--border-color); }
+            .log-info { color: #58a6ff; } .log-success { color: #56d364; } .log-warning { color: #f0ad4e; } .log-error { color: #f85149; }
+            
+            .status-badge { display: inline-block; padding: 0.5rem 1rem; border-radius: 20px; font-size: 0.9rem; font-weight: 600; text-transform: uppercase; }
+            .status-idle { background-color: rgba(86, 211, 100, 0.2); color: #56d364; }
+            .status-running { background-color: rgba(240, 173, 78, 0.2); color: #f0ad4e; animation: pulse 2s infinite; }
+            @keyframes pulse { 0% { opacity: 1; } 50% { opacity: 0.7; } 100% { opacity: 1; } }
+
+            .banner { padding: 2rem; border-radius: 16px; margin-bottom: 2rem; border: 1px solid; }
+            .banner h2 { border-bottom: 1px solid; padding-bottom: 1rem; margin-bottom: 1rem; }
+            .failsafe-banner { background: rgba(231, 76, 60, 0.1); border-color: #e74c3c; }
+            .confirmation-banner { background: rgba(52, 152, 219, 0.1); border-color: #3498db; }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <header class="header"><h1>Ralawise Sync Dashboard</h1><p>Automated Inventory & Product Management</p></header>
+            
+            ${failsafe.isTriggered ? `<div class="banner failsafe-banner"><h2>🚨 Failsafe Active</h2><p style="margin-bottom:1.5rem"><strong>Reason:</strong> ${failsafe.reason}</p><div class="btn-group"><button onclick="clearFailsafe()" class="btn-resume">✅ Clear Failsafe</button></div></div>` : ''}
+            
+            ${confirmation.isAwaiting ? `<div class="banner confirmation-banner"><h2>🤔 Confirmation Required</h2><p style="margin-bottom:1.5rem"><strong>Action Paused:</strong> ${confirmation.message}</p>${confirmationDetailsHTML}<div class="btn-group" style="margin-top:1.5rem"><button onclick="proceed()" class="btn-proceed">👍 Proceed Anyway</button><button onclick="abort()" class="btn-abort">🚫 Abort & Pause System</button></div></div>` : ''}
+            
+            <div class="card">
+              <h2>System Status</h2>
+              <div class="stats">
+                <div class="stat"><h3>Overall Status</h3><p class="status-badge" style="background:${isSystemPaused ? 'rgba(230, 126, 34, 0.2)' : 'rgba(46, 204, 113, 0.2)'};color:${isSystemPaused ? '#e67e22' : '#2ecc71'}">${isSystemPaused ? 'Paused' : 'Active'}</p></div>
+                <div class="stat"><h3>Inventory Sync</h3><p class="status-badge ${isRunning.inventory ? 'status-running' : 'status-idle'}">${isRunning.inventory ? 'Running' : 'Idle'}</p></div>
+                <div class="stat"><h3>Full Import</h3><p class="status-badge ${isRunning.fullImport ? 'status-running' : 'status-idle'}">${isRunning.fullImport ? 'Running' : 'Idle'}</p></div>
+              </div>
+            </div>
+
+            <div class="card">
+              <h2>Manual Controls</h2>
+              <div class="btn-group">
+                <button onclick="togglePause()" class="${isSystemPaused ? 'btn-resume' : 'btn-pause'}" ${isSystemLocked ? 'disabled' : ''}>${isSystemPaused ? '▶️ Resume System' : '⏸️ Pause System'}</button>
+                <button onclick="runInventorySync()" class="btn-action" ${isSystemLocked ? 'disabled' : ''}>🔄 Run Inventory Sync</button>
+                <button onclick="runFullImport()" class="btn-action" ${isSystemLocked ? 'disabled' : ''}>📦 Run Full Import</button>
+                <button onclick="clearLogs()" class="btn-action" ${isSystemLocked ? 'disabled' : ''}>🗑️ Clear Logs</button>
+              </div>
+            </div>
+
+            <div class="card">
+              <h2>Last Run Statistics</h2>
+              <div class="stats">
+                <div class="stat"><h3>Inventory Updated</h3><p>${lastRun.inventory.updated || 0}</p><small>${lastRun.inventory.timestamp ? new Date(lastRun.inventory.timestamp).toLocaleString() : 'Never'}</small></div>
+                <div class="stat"><h3>Products Tagged</h3><p>${lastRun.inventory.tagged || 0}</p><small>With Supplier:Ralawise</small></div>
+                <div class="stat"><h3>Products Created</h3><p>${lastRun.fullImport.created || 0}</p><small>${lastRun.fullImport.timestamp ? new Date(lastRun.fullImport.timestamp).toLocaleString() : 'Never'}</small></div>
+                <div class="stat"><h3>Discontinued</h3><p>${lastRun.fullImport.discontinued || 0}</p><small>Marked as draft</small></div>
+              </div>
+            </div>
+
+            <div class="card">
+                <h2>Activity Log</h2>
+                <div class="logs" id="logs">${logs.map(log => `<div class="log-entry log-${log.type}">[${new Date(log.timestamp).toLocaleTimeString()}] ${log.message}</div>`).join('')}</div>
+            </div>
+        </div>
+        <script>
+            async function apiPost(endpoint, confirmMsg) { if (confirmMsg && !confirm(confirmMsg)) return; const btn = event.target; btn.disabled = true; try { await fetch(endpoint, { method: 'POST' }); window.location.reload(); } catch (e) { alert('Failed: ' + e.message); btn.disabled = false; } }
+            function runInventorySync() { apiPost('/api/sync/inventory', 'Run inventory sync now?'); }
+            function runFullImport() { apiPost('/api/sync/full', 'Create new products and mark discontinued ones?'); }
+            function togglePause() { apiPost('/api/pause/toggle'); }
+            function clearFailsafe() { apiPost('/api/failsafe/clear', 'Clear failsafe and resume operations?'); }
+            function clearLogs() { apiPost('/api/logs/clear', 'Clear all logs?'); }
+            function proceed() { apiPost('/api/confirmation/proceed', 'Proceed with the pending action?'); }
+            function abort() { apiPost('/api/confirmation/abort', 'Abort the action and pause the system?'); }
+            setTimeout(() => window.location.reload(), 30000);
+        </script>
+    </body>
+    </html>`;
     res.send(html);
 });
 
