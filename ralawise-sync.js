@@ -38,8 +38,8 @@ const config = {
         maxRuntime: parseInt(process.env.MAX_RUNTIME_HOURS || '4') * 60 * 60 * 1000
     },
     rateLimit: {
-        requestsPerSecond: 2,
-        burstSize: 40
+        requestsPerSecond: parseInt(process.env.RATE_LIMIT_RPS || '2'),
+        burstSize: parseInt(process.env.RATE_LIMIT_BURST || '40')
     }
 };
 
@@ -107,41 +107,69 @@ async function parseInventoryCSV(stream) { return new Promise((resolve, reject) 
 async function getAllShopifyProducts() { let allProducts = []; let url = `/products.json?limit=250&fields=id,handle,title,variants,tags,status`; addLog('Fetching all Shopify products...', 'info'); while (url) { try { const res = await shopifyRequestWithRetry('get', url); allProducts.push(...res.data.products); const linkHeader = res.headers.link; const nextLinkMatch = linkHeader ? linkHeader.match(/<([^>]+)>;\s*rel="next"/) : null; url = nextLinkMatch ? nextLinkMatch[1].replace(config.shopify.baseUrl, '') : null; } catch (error) { addLog(`Error fetching products: ${error.message}`, 'error'); triggerFailsafe(`Failed to fetch products from Shopify`); return []; } } addLog(`Fetched ${allProducts.length} products.`, 'success'); return allProducts; }
 async function downloadAndExtractZip() { const res = await axios.get(`${config.ralawise.zipUrl}?t=${Date.now()}`, { responseType: 'arraybuffer' }); const tempDir = path.join(__dirname, 'temp', `ralawise_${Date.now()}`); fs.mkdirSync(tempDir, { recursive: true }); const zip = new AdmZip(res.data); zip.extractAllTo(tempDir, true); return { tempDir, csvFiles: fs.readdirSync(tempDir).filter(f => f.endsWith('.csv')).map(f => path.join(tempDir, f)) }; }
 
-// FIXED: Using REST API for inventory updates instead of buggy GraphQL
-async function updateInventoryWithREST(updates, runResult) {
-    addLog(`Updating ${updates.length} items via REST API...`, 'info');
-    syncProgress.inventory.total = updates.length;
+async function updateInventoryWithGraphQL(updates, runResult) {
+    addLog(`Updating ${updates.length} items via GraphQL...`, 'info');
+    const BATCH_SIZE = 100; // Max items per GraphQL call
+    const batches = [];
+    for (let i = 0; i < updates.length; i += BATCH_SIZE) {
+        batches.push(updates.slice(i, i + BATCH_SIZE));
+    }
+
+    syncProgress.inventory.total = batches.length;
     let processedItems = 0;
 
-    for (let i = 0; i < updates.length; i++) {
+    for (let i = 0; i < batches.length; i++) {
         if (syncProgress.inventory.cancelled) {
             runResult.status = 'cancelled';
-            addLog('Inventory update cancelled by user.', 'warning');
+            addLog('GraphQL update cancelled by user.', 'warning');
             return;
         }
 
-        const update = updates[i];
+        const batch = batches[i];
+        const mutation = `
+            mutation inventoryBulkAdjustQuantityAtLocation($inventoryItemAdjustments: [InventoryAdjustItemInput!]!, $locationId: ID!) {
+                inventoryBulkAdjustQuantityAtLocation(inventoryItemAdjustments: $inventoryItemAdjustments, locationId: $locationId) {
+                    userErrors { field message }
+                    inventoryLevels { id available }
+                }
+            }`;
+        
+        const variables = {
+            locationId: `gid://shopify/Location/${config.shopify.locationId}`,
+            inventoryItemAdjustments: batch.map(u => ({
+                inventoryItemId: `gid://shopify/InventoryItem/${u.match.variant.inventory_item_id}`,
+                availableDelta: u.newQty - u.oldQty
+            }))
+        };
+        
         try {
-            await shopifyRequestWithRetry('post', '/inventory_levels/set.json', {
-                location_id: config.shopify.locationId,
-                inventory_item_id: update.match.variant.inventory_item_id,
-                available: update.newQty
-            });
+            const response = await shopifyRequestWithRetry('post', config.shopify.graphqlUrl, { query: mutation, variables });
             
-            runResult.updated++;
-            processedItems++;
+            const topLevelErrors = response.data?.errors;
+            const mutationResult = response.data?.data?.inventoryBulkAdjustQuantityAtLocation;
+            const userErrors = mutationResult?.userErrors;
+
+            if (topLevelErrors && topLevelErrors.length > 0) {
+                addLog(`GraphQL request for batch ${i + 1} failed: ${topLevelErrors[0].message}`, 'error');
+                runResult.errors += batch.length;
+            } else if (userErrors && userErrors.length > 0) {
+                addLog(`GraphQL batch ${i + 1} had ${userErrors.length} user errors. Sample: ${userErrors[0].message}`, 'error');
+                runResult.errors += batch.length;
+            } else if (!mutationResult) {
+                addLog(`GraphQL response for batch ${i + 1} was malformed.`, 'error');
+                runResult.errors += batch.length;
+            } else {
+                runResult.updated += batch.length;
+                processedItems += batch.length;
+            }
+
         } catch (e) {
-            const errorMsg = e.response?.data?.errors || e.message;
-            addLog(`Failed to update SKU ${update.sku}: ${errorMsg}`, 'error');
-            runResult.errors++;
+            const errorMsg = e.response?.data?.errors?.[0]?.message || e.message;
+            addLog(`GraphQL batch ${i + 1} request failed entirely: ${errorMsg}`, 'error');
+            runResult.errors += batch.length;
         }
-        
-        updateProgress('inventory', i + 1, updates.length);
-        
-        // Log progress every 100 items
-        if ((i + 1) % 100 === 0 || i === updates.length - 1) {
-            addLog(`Progress: ${i + 1}/${updates.length} items processed`, 'info');
-        }
+        updateProgress('inventory', i + 1, batches.length);
+        addLog(`Processed batch ${i + 1}/${batches.length}. Total items updated so far: ${processedItems}`, 'info');
     }
 }
 
@@ -189,7 +217,7 @@ async function updateInventoryBySKU(inventoryMap) {
                 finalizeRun('completed');
                 return;
             }
-            await updateInventoryWithREST(updatesToPerform, runResult);
+            await updateInventoryWithGraphQL(updatesToPerform, runResult);
             finalizeRun(syncProgress.inventory.cancelled ? 'cancelled' : 'completed');
         };
         
@@ -216,17 +244,9 @@ async function processFullImport(csvFiles) {
     };
     try {
         addLog('=== FULL IMPORT: ANALYSIS ===', 'info');
-        const allRows = await Promise.all(csvFiles.map(filePath => new Promise((res, rej) => { 
-            const p = []; 
-            fs.createReadStream(filePath)
-                .pipe(csv())
-                .on('data', r => p.push({ ...r, price: applyRalawisePricing(parseFloat(r['Variant Price'])) }))
-                .on('end', () => res(p))
-                .on('error', rej); 
-        })));
-        const flatRows = allRows.flat();
+        const allRows = (await Promise.all(csvFiles.map(filePath => new Promise((res, rej) => { const p = []; fs.createReadStream(filePath).pipe(csv()).on('data', r => p.push({ ...r, price: applyRalawisePricing(parseFloat(r['Variant Price'])) })).on('end', () => res(p)).on('error', rej); })))).flat();
         const productsByHandle = new Map();
-        for (const row of flatRows) {
+        for (const row of allRows) {
             if (!row.Handle) continue;
             if (!productsByHandle.has(row.Handle)) productsByHandle.set(row.Handle, { ...row, tags: `${row.Tags || ''},Supplier:Ralawise`.replace(/^,/, ''), images: [], variants: [] });
             const p = productsByHandle.get(row.Handle);
@@ -238,7 +258,7 @@ async function processFullImport(csvFiles) {
         const toCreate = Array.from(productsByHandle.values()).filter(p => !existingHandles.has(p.Handle));
         addLog(`Found ${toCreate.length} new products to create.`, 'info');
         
-        for (const p of toCreate.slice(0, 50)) {
+        for (const p of toCreate) {
             try {
                 const res = await shopifyRequestWithRetry('post', '/products.json', { product: { title: p.Title, handle: p.Handle, body_html: p['Body (HTML)'], vendor: p.Vendor, tags: p.tags, images: p.images, variants: p.variants.map(v => ({...v, inventory_management: 'shopify' })) } });
                 for (const v of res.data.product.variants) {
@@ -253,7 +273,7 @@ async function processFullImport(csvFiles) {
         const toDiscontinue = shopifyProducts.filter(p => p.tags?.includes('Supplier:Ralawise') && !newHandles.has(p.handle));
         addLog(`Found ${toDiscontinue.length} products to discontinue.`, 'info');
         
-        for (const p of toDiscontinue.slice(0, 50)) {
+        for (const p of toDiscontinue) {
             try {
                 await shopifyRequestWithRetry('put', `/products/${p.id}.json`, { product: { id: p.id, status: 'draft' } });
                 for (const v of p.variants) { if (v.inventory_item_id) await shopifyRequestWithRetry('post', '/inventory_levels/set.json', { location_id: config.shopify.locationId, inventory_item_id: v.inventory_item_id, available: 0 }).catch(()=>{}); }
@@ -284,15 +304,15 @@ const isSystemLocked = () => isRunning.inventory || isRunning.fullImport || isSy
 // ============================================
 
 app.get('/', (req, res) => {
-    const inventoryProgressHTML = syncProgress.inventory.isActive && syncProgress.inventory.total > 0 ? `<div class="progress-container"><div class="progress-bar" style="width:${(syncProgress.inventory.current / syncProgress.inventory.total * 100).toFixed(1)}%"></div><small>${syncProgress.inventory.current}/${syncProgress.inventory.total} items</small></div>` : '';
+    const inventoryProgressHTML = syncProgress.inventory.isActive && syncProgress.inventory.total > 0 ? `<div class="progress-container"><div class="progress-bar"><div class="progress-fill" style="width: ${(syncProgress.inventory.current / syncProgress.inventory.total * 100).toFixed(1)}%;"></div></div><small>${syncProgress.inventory.current}/${syncProgress.inventory.total} batches</small></div>` : '';
     const lastFullImport = runHistory.find(r => r.type === 'Full Import');
     let newProductsHTML = '<h4>Newly Created Products</h4><p>No new products in last run.</p>';
     if (lastFullImport?.createdProducts?.length > 0) {
         newProductsHTML = `<h4>Newly Created Products (${lastFullImport.createdProducts.length})</h4>
-        <ul class="product-list">${lastFullImport.createdProducts.slice(0, 10).map(p => `<li><a href="https://${config.shopify.domain}/products/${p.handle}" target="_blank">${p.title}</a></li>`).join('')}</ul>`;
+        <ul class="product-list">${lastFullImport.createdProducts.slice(0, 10).map(p => `<li><a href="https://${config.shopify.domain}/admin/products/${p.handle}" target="_blank">${p.title}</a></li>`).join('')}</ul>`;
     }
 
-    const html = `<!DOCTYPE html><html lang="en"><head><title>Ralawise Sync</title><meta name="viewport" content="width=device-width, initial-scale=1"><style>body{font-family:-apple-system,BlinkMacSystemFont,sans-serif;background:#0d1117;color:#c9d1d9;margin:0;line-height:1.5;}.container{max-width:1400px;margin:auto;padding:1rem;}.card{background:#161b22;border:1px solid #30363d;padding:1.5rem;border-radius:6px;margin-bottom:1rem;}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:1rem;}.btn{padding:0.5rem 1rem;border:1px solid #30363d;border-radius:6px;cursor:pointer;background:#21262d;color:#c9d1d9;font-weight:600;}.btn-primary{background:#238636;color:white;border-color:#2ea043;}.btn-danger{background:#da3633;color:white;border-color:#f85149}.btn:disabled{opacity:0.5;cursor:not-allowed;}.logs{background:#010409;padding:1rem;height:300px;overflow-y:auto;border-radius:6px;font-family:monospace;white-space:pre-wrap;font-size:0.875em;}.alert{padding:1rem;border-radius:6px;margin-bottom:1rem;border:1px solid;}.alert-warning{background-color:rgba(210,149,34,0.1);border-color:#d29922;}.stat-card{text-align:center;}.stat-value{font-size:2.5rem;font-weight:600;}.stat-label{font-size:0.8rem;color:#8b949e;}.product-list{list-style:none;padding:0;font-size:0.9em;max-height:150px;overflow-y:auto;} .product-list a{color:#58a6ff;text-decoration:none;} .product-list a:hover{text-decoration:underline;} .progress-container{margin-top:0.5rem;} .progress-bar{height:8px;background:#30363d;border-radius:4px;overflow:hidden; width: 100%;} .progress-fill{height:100%;background:linear-gradient(90deg, #1f6feb, #2ea043);transition:width 0.5s;}</style></head><body><div class="container"><h1>Ralawise Sync</h1>
+    const html = `<!DOCTYPE html><html lang="en"><head><title>Ralawise Sync</title><meta name="viewport" content="width=device-width, initial-scale=1"><style>body{font-family:-apple-system,BlinkMacSystemFont,sans-serif;background:#0d1117;color:#c9d1d9;margin:0;line-height:1.5;}.container{max-width:1400px;margin:auto;padding:1rem;}.card{background:#161b22;border:1px solid #30363d;padding:1.5rem;border-radius:6px;margin-bottom:1rem;}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:1rem;}.btn{padding:0.5rem 1rem;border:1px solid #30363d;border-radius:6px;cursor:pointer;background:#21262d;color:#c9d1d9;font-weight:600;}.btn-primary{background:#238636;color:white;border-color:#2ea043;}.btn-danger{background:#da3633;color:white;border-color:#f85149}.btn:disabled{opacity:0.5;cursor:not-allowed;}.logs{background:#010409;padding:1rem;height:300px;overflow-y:auto;border-radius:6px;font-family:monospace;white-space:pre-wrap;font-size:0.875em;}.alert{padding:1rem;border-radius:6px;margin-bottom:1rem;border:1px solid;}.alert-warning{background-color:rgba(210,149,34,0.1);border-color:#d29922;}.stat-card{text-align:center;}.stat-value{font-size:2.5rem;font-weight:600;}.stat-label{font-size:0.8rem;color:#8b949e;}.product-list{list-style:none;padding:0;font-size:0.9em;max-height:150px;overflow-y:auto;} .product-list a{color:#58a6ff;text-decoration:none;} .product-list a:hover{text-decoration:underline;} .progress-container{margin-top:0.5rem; display: flex; align-items: center; gap: 10px;} .progress-bar{flex-grow: 1; height:8px;background:#30363d;border-radius:4px;overflow:hidden;} .progress-fill{height:100%;background:linear-gradient(90deg, #1f6feb, #2ea043);transition:width 0.5s;}</style></head><body><div class="container"><h1>Ralawise Sync</h1>
     ${confirmation.isAwaiting ? `<div class="alert alert-warning"><h3>🤔 Confirmation Required</h3><p>${confirmation.message}</p><div><button onclick="apiPost('/api/confirmation/proceed')" class="btn btn-primary">Proceed</button> <button onclick="apiPost('/api/confirmation/abort')" class="btn">Abort & Pause</button></div></div>` : ''}
     <div class="grid">
         <div class="card"><h2>System</h2><p>Status: ${isSystemPaused?'Paused':failsafe.isTriggered?'FAILSAFE': isRunning.inventory || isRunning.fullImport ? 'Busy' : 'Active'}</p><button onclick="apiPost('/api/pause/toggle')" class="btn" ${failsafe.isTriggered||confirmation.isAwaiting?'disabled':''}>${isSystemPaused?'Resume':'Pause'}</button>${failsafe.isTriggered?`<button onclick="apiPost('/api/failsafe/clear')" class="btn">Clear Failsafe</button>`:''}</div>
@@ -301,7 +321,7 @@ app.get('/', (req, res) => {
         <div class="card"><h2>Last Full Import Summary</h2><div class="grid" style="grid-template-columns:1fr 1fr;"><div class="stat-card"><div class="stat-value">${lastFullImport?.created ?? 'N/A'}</div><div class="stat-label">New Products</div></div><div class="stat-card"><div class="stat-value">${lastFullImport?.discontinued ?? 'N/A'}</div><div class="stat-label">Discontinued</div></div></div><hr style="border-color:#30363d;margin:1rem 0;">${newProductsHTML}</div>
     </div>
     <div class="card"><h2>Logs</h2><div class="logs">${logs.map(log=>`<div class="log-entry log-${log.type}">[${new Date(log.timestamp).toLocaleTimeString()}] ${log.message}</div>`).join('')}</div></div>
-    </div><script>async function apiPost(url,confirmMsg){if(confirmMsg&&!confirm(confirmMsg))return;try{const btn=event.target;if(btn)btn.disabled=true;await fetch(url,{method:'POST'});setTimeout(()=>location.reload(),500)}catch(e){alert(e.message);if(btn)btn.disabled=false;}}</script></body></html>`;
+    </div><script>async function apiPost(url,confirmMsg){if(confirmMsg&&!confirm(confirmMsg))return;const btn=event.target;try{if(btn)btn.disabled=true;await fetch(url,{method:'POST'});setTimeout(()=>location.reload(),500)}catch(e){alert(e.message);if(btn)btn.disabled=false;}}</script></body></html>`;
     res.send(html);
 });
 
