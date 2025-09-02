@@ -22,7 +22,6 @@ const config = {
         accessToken: process.env.SHOPIFY_ACCESS_TOKEN, 
         locationId: process.env.SHOPIFY_LOCATION_ID, 
         baseUrl: `https://${process.env.SHOPIFY_DOMAIN}/admin/api/2024-01`,
-        // NEW: GraphQL endpoint for bulk operations
         graphqlUrl: `https://${process.env.SHOPIFY_DOMAIN}/admin/api/2024-01/graphql.json` 
     },
     ftp: { 
@@ -36,11 +35,7 @@ const config = {
     },
     failsafe: { 
         inventoryChangePercentage: parseInt(process.env.FAILSAFE_INVENTORY_CHANGE_PERCENTAGE || '10'),
-        maxRuntime: parseInt(process.env.MAX_RUNTIME_HOURS || '4') * 60 * 60 * 1000 // Reduced runtime, as it should be much faster now
-    },
-    rateLimit: {
-        requestsPerSecond: parseFloat(process.env.SHOPIFY_RATE_LIMIT || '2'),
-        burstSize: parseInt(process.env.SHOPIFY_BURST_SIZE || '40')
+        maxRuntime: parseInt(process.env.MAX_RUNTIME_HOURS || '4') * 60 * 60 * 1000
     }
 };
 
@@ -64,7 +59,6 @@ let syncProgress = {
     fullImport: { isActive: false, created: 0, discontinued: 0 } 
 };
 
-// ---UNCHANGED HELPERS (RateLimiter, addLog, notifyTelegram, etc.)---
 class RateLimiter { constructor(rps=2,bs=40){this.rps=rps;this.bs=bs;this.tokens=bs;this.lastRefill=Date.now();this.queue=[];this.processing=false}async acquire(){return new Promise(r=>{this.queue.push(r);this.process()})}async process(){if(this.processing)return;this.processing=true;while(this.queue.length>0){const n=Date.now();const p=(n-this.lastRefill)/1000;this.tokens=Math.min(this.bs,this.tokens+p*this.rps);this.lastRefill=n;if(this.tokens>=1){this.tokens--;const r=this.queue.shift();r()}else{const w=(1/this.rps)*1000;await new Promise(r=>setTimeout(r,w))}}this.processing=false}}
 const rateLimiter = new RateLimiter(config.rateLimit.requestsPerSecond, config.rateLimit.burstSize);
 function addLog(message, type = 'info') { const log = { timestamp: new Date().toISOString(), message, type }; logs.unshift(log); if (logs.length > 500) logs.pop(); console.log(`[${new Date().toLocaleTimeString()}] [${type.toUpperCase()}] ${message}`); }
@@ -104,16 +98,16 @@ function requestConfirmation(jobKey, message, details, proceedAction) {
 // CORE LOGIC
 // ============================================
 
-async function fetchInventoryFromFTP() { /* ... unchanged ... */ }
-async function parseInventoryCSV(stream) { /* ... unchanged ... */ }
-async function getAllShopifyProducts() { /* ... unchanged ... */ }
-async function downloadAndExtractZip() { /* ... unchanged ... */ }
+async function fetchInventoryFromFTP() { const client = new ftp.Client(); try { await client.access(config.ftp); const chunks = []; await client.downloadTo(new Writable({ write(c, e, cb) { chunks.push(c); cb(); } }), '/Stock/Stock_Update.csv'); return Readable.from(Buffer.concat(chunks)); } catch (e) { addLog(`FTP error: ${e.message}`, 'error'); throw e; } finally { client.close(); } }
+async function parseInventoryCSV(stream) { return new Promise((resolve, reject) => { const inventory = new Map(); stream.pipe(csv({ headers: ['SKU', 'Quantity'], skipLines: 1 })).on('data', row => { if (row.SKU) inventory.set(row.SKU.trim(), Math.min(parseInt(row.Quantity) || 0, config.ralawise.maxInventory)); }).on('end', () => resolve(inventory)).on('error', reject); }); }
+async function getAllShopifyProducts() { let allProducts = []; let url = `/products.json?limit=250&fields=id,handle,title,variants,tags,status`; addLog('Fetching all Shopify products...', 'info'); while (url) { try { const res = await shopifyRequestWithRetry('get', url); allProducts.push(...res.data.products); const linkHeader = res.headers.link; const nextLinkMatch = linkHeader ? linkHeader.match(/<([^>]+)>;\s*rel="next"/) : null; url = nextLinkMatch ? nextLinkMatch[1].replace(config.shopify.baseUrl, '') : null; } catch (error) { addLog(`Error fetching products: ${error.message}`, 'error'); triggerFailsafe(`Failed to fetch products from Shopify`); return []; } } addLog(`Fetched ${allProducts.length} products.`, 'success'); return allProducts; }
+async function downloadAndExtractZip() { const res = await axios.get(`${config.ralawise.zipUrl}?t=${Date.now()}`, { responseType: 'arraybuffer' }); const tempDir = path.join(__dirname, 'temp', `ralawise_${Date.now()}`); fs.mkdirSync(tempDir, { recursive: true }); const zip = new AdmZip(res.data); zip.extractAllTo(tempDir, true); return { tempDir, csvFiles: fs.readdirSync(tempDir).filter(f => f.endsWith('.csv')).map(f => path.join(tempDir, f)) }; }
 
 // NEW: High-performance GraphQL inventory update function
 async function updateInventoryWithGraphQL(updates, runResult) {
     addLog(`Updating ${updates.length} items via GraphQL...`, 'info');
     const BATCH_SIZE = 100; // Max items per GraphQL call
-    let batches = [];
+    const batches = [];
     for (let i = 0; i < updates.length; i += BATCH_SIZE) {
         batches.push(updates.slice(i, i + BATCH_SIZE));
     }
@@ -124,7 +118,7 @@ async function updateInventoryWithGraphQL(updates, runResult) {
     for (let i = 0; i < batches.length; i++) {
         if (syncProgress.inventory.cancelled) {
             runResult.status = 'cancelled';
-            addLog('GraphQL update cancelled.', 'warning');
+            addLog('GraphQL update cancelled by user.', 'warning');
             return;
         }
 
@@ -146,18 +140,23 @@ async function updateInventoryWithGraphQL(updates, runResult) {
         };
         
         try {
-            await shopifyRequestWithRetry('post', config.shopify.graphqlUrl, { query: mutation, variables });
-            runResult.updated += batch.length;
-            processedItems += batch.length;
+            const response = await shopifyRequestWithRetry('post', config.shopify.graphqlUrl, { query: mutation, variables });
+            const userErrors = response.data?.data?.inventoryBulkAdjustQuantityAtLocation?.userErrors;
+
+            if (userErrors && userErrors.length > 0) {
+                 addLog(`GraphQL batch had ${userErrors.length} errors. Sample: ${userErrors[0].message}`, 'error');
+                 runResult.errors += batch.length; // Assume whole batch failed for simplicity
+            } else {
+                runResult.updated += batch.length;
+                processedItems += batch.length;
+            }
         } catch (e) {
             const errorMsg = e.response?.data?.errors?.[0]?.message || e.message;
-            addLog(`GraphQL batch failed: ${errorMsg}`, 'error');
-            runResult.errors += batch.length; // Assume whole batch failed
-            // Log individual items from the failed batch for easier debugging
-            batch.forEach(u => addLog(` -> Failed SKU in batch: ${u.sku}`, 'error'));
+            addLog(`GraphQL batch request failed: ${errorMsg}`, 'error');
+            runResult.errors += batch.length;
         }
         updateProgress('inventory', i + 1, batches.length);
-        addLog(`Processed batch ${i + 1}/${batches.length}. Total items updated: ${processedItems}`, 'info');
+        addLog(`Processed batch ${i + 1}/${batches.length}. Total items updated so far: ${processedItems}`, 'info');
     }
 }
 
@@ -201,6 +200,11 @@ async function updateInventoryBySKU(inventoryMap) {
         addLog(`Analysis: ${updatesToPerform.length} updates needed. Change: ${changePercentage.toFixed(2)}%`, 'info');
 
         const executeUpdates = async () => {
+            if (updatesToPerform.length === 0) {
+                addLog('No inventory updates required.', 'info');
+                finalizeRun('completed');
+                return;
+            }
             await updateInventoryWithGraphQL(updatesToPerform, runResult);
             finalizeRun(syncProgress.inventory.cancelled ? 'cancelled' : 'completed');
         };
@@ -296,7 +300,7 @@ app.get('/', (req, res) => {
         <ul class="product-list">${lastFullImport.createdProducts.slice(0, 10).map(p => `<li><a href="https://${config.shopify.domain}/products/${p.handle}" target="_blank">${p.title}</a></li>`).join('')}</ul>`;
     }
 
-    const html = `<!DOCTYPE html><html lang="en"><head><title>Ralawise Sync</title><meta name="viewport" content="width=device-width, initial-scale=1"><style>body{font-family:-apple-system,BlinkMacSystemFont,sans-serif;background:#0d1117;color:#c9d1d9;margin:0;line-height:1.5;}.container{max-width:1400px;margin:auto;padding:1rem;}.card{background:#161b22;border:1px solid #3036d;padding:1.5rem;border-radius:6px;margin-bottom:1rem;}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:1rem;}.btn{padding:0.5rem 1rem;border:1px solid #30363d;border-radius:6px;cursor:pointer;background:#21262d;color:#c9d1d9;font-weight:600;}.btn-primary{background:#238636;color:white;border-color:#2ea043;}.btn-danger{background:#da3633;color:white;border-color:#f85149}.btn:disabled{opacity:0.5;cursor:not-allowed;}.logs{background:#010409;padding:1rem;height:300px;overflow-y:auto;border-radius:6px;font-family:monospace;white-space:pre-wrap;font-size:0.875em;}.alert{padding:1rem;border-radius:6px;margin-bottom:1rem;border:1px solid;}.alert-warning{background-color:rgba(210,149,34,0.1);border-color:#d29922;}.stat-card{text-align:center;}.stat-value{font-size:2.5rem;font-weight:600;}.stat-label{font-size:0.8rem;color:#8b949e;}.product-list{list-style:none;padding:0;font-size:0.9em;max-height:150px;overflow-y:auto;} .product-list a{color:#58a6ff;text-decoration:none;} .product-list a:hover{text-decoration:underline;} .progress-container{margin-top:0.5rem;} .progress-bar{height:8px;background:#30363d;border-radius:4px;overflow:hidden;} .progress-fill{height:100%;background:linear-gradient(90deg, #1f6feb, #2ea043);transition:width 0.5s;}</style></head><body><div class="container"><h1>Ralawise Sync</h1>
+    const html = `<!DOCTYPE html><html lang="en"><head><title>Ralawise Sync</title><meta name="viewport" content="width=device-width, initial-scale=1"><style>body{font-family:-apple-system,BlinkMacSystemFont,sans-serif;background:#0d1117;color:#c9d1d9;margin:0;line-height:1.5;}.container{max-width:1400px;margin:auto;padding:1rem;}.card{background:#161b22;border:1px solid #30363d;padding:1.5rem;border-radius:6px;margin-bottom:1rem;}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:1rem;}.btn{padding:0.5rem 1rem;border:1px solid #30363d;border-radius:6px;cursor:pointer;background:#21262d;color:#c9d1d9;font-weight:600;}.btn-primary{background:#238636;color:white;border-color:#2ea043;}.btn-danger{background:#da3633;color:white;border-color:#f85149}.btn:disabled{opacity:0.5;cursor:not-allowed;}.logs{background:#010409;padding:1rem;height:300px;overflow-y:auto;border-radius:6px;font-family:monospace;white-space:pre-wrap;font-size:0.875em;}.alert{padding:1rem;border-radius:6px;margin-bottom:1rem;border:1px solid;}.alert-warning{background-color:rgba(210,149,34,0.1);border-color:#d29922;}.stat-card{text-align:center;}.stat-value{font-size:2.5rem;font-weight:600;}.stat-label{font-size:0.8rem;color:#8b949e;}.product-list{list-style:none;padding:0;font-size:0.9em;max-height:150px;overflow-y:auto;} .product-list a{color:#58a6ff;text-decoration:none;} .product-list a:hover{text-decoration:underline;} .progress-container{margin-top:0.5rem;} .progress-bar{height:8px;background:#30363d;border-radius:4px;overflow:hidden; width: 100%;} .progress-fill{height:100%;background:linear-gradient(90deg, #1f6feb, #2ea043);transition:width 0.5s;}</style></head><body><div class="container"><h1>Ralawise Sync</h1>
     ${confirmation.isAwaiting ? `<div class="alert alert-warning"><h3>🤔 Confirmation Required</h3><p>${confirmation.message}</p><div><button onclick="apiPost('/api/confirmation/proceed')" class="btn btn-primary">Proceed</button> <button onclick="apiPost('/api/confirmation/abort')" class="btn">Abort & Pause</button></div></div>` : ''}
     <div class="grid">
         <div class="card"><h2>System</h2><p>Status: ${isSystemPaused?'Paused':failsafe.isTriggered?'FAILSAFE': isRunning.inventory || isRunning.fullImport ? 'Busy' : 'Active'}</p><button onclick="apiPost('/api/pause/toggle')" class="btn" ${failsafe.isTriggered||confirmation.isAwaiting?'disabled':''}>${isSystemPaused?'Resume':'Pause'}</button>${failsafe.isTriggered?`<button onclick="apiPost('/api/failsafe/clear')" class="btn">Clear Failsafe</button>`:''}</div>
@@ -305,7 +309,7 @@ app.get('/', (req, res) => {
         <div class="card"><h2>Last Full Import Summary</h2><div class="grid" style="grid-template-columns:1fr 1fr;"><div class="stat-card"><div class="stat-value">${lastFullImport?.created ?? 'N/A'}</div><div class="stat-label">New Products</div></div><div class="stat-card"><div class="stat-value">${lastFullImport?.discontinued ?? 'N/A'}</div><div class="stat-label">Discontinued</div></div></div><hr style="border-color:#30363d;margin:1rem 0;">${newProductsHTML}</div>
     </div>
     <div class="card"><h2>Logs</h2><div class="logs">${logs.map(log=>`<div class="log-entry log-${log.type}">[${new Date(log.timestamp).toLocaleTimeString()}] ${log.message}</div>`).join('')}</div></div>
-    </div><script>async function apiPost(url,confirmMsg){if(confirmMsg&&!confirm(confirmMsg))return;try{const btn=event.target;btn.disabled=true;await fetch(url,{method:'POST'});setTimeout(()=>location.reload(),500)}catch(e){alert(e.message)}};setTimeout(()=>location.reload(),30000)</script></body></html>`;
+    </div><script>async function apiPost(url,confirmMsg){if(confirmMsg&&!confirm(confirmMsg))return;try{const btn=event.target;if(btn)btn.disabled=true;await fetch(url,{method:'POST'});setTimeout(()=>location.reload(),500)}catch(e){alert(e.message);if(btn)btn.disabled=false;}}</script></body></html>`;
     res.send(html);
 });
 
