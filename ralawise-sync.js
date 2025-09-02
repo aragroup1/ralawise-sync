@@ -144,18 +144,33 @@ async function updateInventoryWithGraphQL(updates, runResult) {
         
         try {
             const response = await shopifyRequestWithRetry('post', config.shopify.graphqlUrl, { query: mutation, variables });
-            const userErrors = response.data?.data?.inventoryBulkAdjustQuantityAtLocation?.userErrors;
+            
+            // **FIXED LOGIC**: Robustly check for all types of GraphQL errors
+            const topLevelErrors = response.data?.errors;
+            const mutationResult = response.data?.data?.inventoryBulkAdjustQuantityAtLocation;
+            const userErrors = mutationResult?.userErrors;
 
-            if (userErrors && userErrors.length > 0) {
-                 addLog(`GraphQL batch had ${userErrors.length} errors. Sample: ${userErrors[0].message}`, 'error');
-                 runResult.errors += batch.length; // Assume whole batch failed for simplicity
+            if (topLevelErrors && topLevelErrors.length > 0) {
+                // This catches fundamental request errors (e.g., permissions, bad query)
+                addLog(`GraphQL request for batch ${i + 1} failed: ${topLevelErrors[0].message}`, 'error');
+                runResult.errors += batch.length;
+            } else if (userErrors && userErrors.length > 0) {
+                // This catches validation errors for specific items in the batch
+                addLog(`GraphQL batch ${i + 1} had ${userErrors.length} user errors. Sample: ${userErrors[0].message}`, 'error');
+                runResult.errors += batch.length; // Assume whole batch failed for simplicity
+            } else if (!mutationResult) {
+                // This is a failsafe for unexpected response structures
+                addLog(`GraphQL response for batch ${i + 1} was malformed.`, 'error');
+                runResult.errors += batch.length;
             } else {
+                // This is the only true success case
                 runResult.updated += batch.length;
                 processedItems += batch.length;
             }
+
         } catch (e) {
             const errorMsg = e.response?.data?.errors?.[0]?.message || e.message;
-            addLog(`GraphQL batch request failed: ${errorMsg}`, 'error');
+            addLog(`GraphQL batch ${i + 1} request failed entirely: ${errorMsg}`, 'error');
             runResult.errors += batch.length;
         }
         updateProgress('inventory', i + 1, batches.length);
