@@ -20,7 +20,7 @@ const config = {
     shopify: { 
         domain: process.env.SHOPIFY_DOMAIN, 
         accessToken: process.env.SHOPIFY_ACCESS_TOKEN, 
-        locationId: process.env.SHOPIFY_LOCATION_ID || '91260682575', // Updated default location ID
+        locationId: '91260682575', // HARDCODED to correct location ID
         baseUrl: `https://${process.env.SHOPIFY_DOMAIN}/admin/api/2024-01`,
         graphqlUrl: `https://${process.env.SHOPIFY_DOMAIN}/admin/api/2024-01/graphql.json` 
     },
@@ -46,11 +46,7 @@ const config = {
 const requiredConfig = ['SHOPIFY_DOMAIN', 'SHOPIFY_ACCESS_TOKEN', 'FTP_HOST', 'FTP_USERNAME', 'FTP_PASSWORD'];
 if (requiredConfig.some(key => !process.env[key])) { console.error('Missing required environment variables.'); process.exit(1); }
 
-// Set default location ID if not provided in environment
-if (!config.shopify.locationId) {
-    config.shopify.locationId = '91260682575';
-    console.log('Using default location ID: 91260682575');
-}
+console.log(`Using Shopify Location ID: ${config.shopify.locationId}`);
 
 // ============================================
 // STATE MANAGEMENT & HELPERS
@@ -128,7 +124,7 @@ async function updateInventoryWithREST(updates, runResult) {
 
         const update = updates[i];
         try {
-            await shopifyRequestWithRetry('post', '/inventory_levels/set.json', {
+            const response = await shopifyRequestWithRetry('post', '/inventory_levels/set.json', {
                 location_id: config.shopify.locationId,
                 inventory_item_id: update.match.variant.inventory_item_id,
                 available: update.newQty
@@ -138,7 +134,10 @@ async function updateInventoryWithREST(updates, runResult) {
             processedItems++;
         } catch (e) {
             const errorMsg = e.response?.data?.errors || e.message;
-            addLog(`Failed to update SKU ${update.sku}: ${errorMsg}`, 'error');
+            // Only log first few errors to avoid spam
+            if (runResult.errors < 10) {
+                addLog(`Failed to update SKU ${update.sku}: ${errorMsg}`, 'error');
+            }
             runResult.errors++;
         }
         
@@ -146,8 +145,12 @@ async function updateInventoryWithREST(updates, runResult) {
         
         // Log progress every 100 items
         if ((i + 1) % 100 === 0 || i === updates.length - 1) {
-            addLog(`Progress: ${i + 1}/${updates.length} items processed`, 'info');
+            addLog(`Progress: ${i + 1}/${updates.length} items processed (${processedItems} successful, ${runResult.errors} errors)`, 'info');
         }
+    }
+    
+    if (runResult.errors > 10) {
+        addLog(`Total of ${runResult.errors} items failed to update`, 'error');
     }
 }
 
