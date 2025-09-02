@@ -79,7 +79,7 @@ function loadHistory() { try { if (fs.existsSync(HISTORY_FILE)) { runHistory = J
 function saveHistory() { try { if (runHistory.length > 100) runHistory.pop(); fs.writeFileSync(HISTORY_FILE, JSON.stringify(runHistory, null, 2)); } catch (e) { addLog(`Could not save history: ${e.message}`, 'warning'); } }
 function addToHistory(runData) { runHistory.unshift(runData); saveHistory(); }
 function checkPauseStateOnStartup() { if (fs.existsSync(PAUSE_LOCK_FILE)) { isSystemPaused = true; } loadHistory(); }
-async function shopifyRequestWithRetry(method, url, data = null, retries = 5) { let lastError; for (let attempt = 0; attempt < retries; attempt++) { try { await rateLimiter.acquire(); switch (method.toLowerCase()) { case 'get': return await shopifyClient.get(url); case 'post': return await shopifyClient.post(url, data); case 'put': return await shopifyClient.put(url, data); } } catch (error) { lastError = error; if (error.response?.status === 429) { const retryAfter = (parseInt(error.response.headers['retry-after'] || 2) * 1000); await delay(retryAfter + 500); } else if (error.response?.status >= 500) { await delay(1000 * Math.pow(2, attempt)); } else { throw error; } } } throw lastError; }
+async function shopifyRequestWithRetry(method, url, data = null, retries = 5) { let lastError; for (let attempt = 0; attempt < retries; attempt++) { try { await rateLimiter.acquire(); switch (method.toLowerCase()) { case 'get': return await shopifyClient.get(url); case 'post': return await shopifyClient.post(url, data); case 'put': return await shopifyClient.put(url, data); case 'delete': return await shopifyClient.delete(url); } } catch (error) { lastError = error; if (error.response?.status === 429) { const retryAfter = (parseInt(error.response.headers['retry-after'] || 2) * 1000); await delay(retryAfter + 500); } else if (error.response?.status >= 500) { await delay(1000 * Math.pow(2, attempt)); } else { throw error; } } } throw lastError; }
 
 function requestConfirmation(jobKey, message, details, proceedAction) { 
     confirmation = { 
@@ -109,11 +109,12 @@ async function parseInventoryCSV(stream) { return new Promise((resolve, reject) 
 async function getAllShopifyProducts() { let allProducts = []; let url = `/products.json?limit=250&fields=id,handle,title,variants,tags,status`; addLog('Fetching all Shopify products...', 'info'); while (url) { try { const res = await shopifyRequestWithRetry('get', url); allProducts.push(...res.data.products); const linkHeader = res.headers.link; const nextLinkMatch = linkHeader ? linkHeader.match(/<([^>]+)>;\s*rel="next"/) : null; url = nextLinkMatch ? nextLinkMatch[1].replace(config.shopify.baseUrl, '') : null; } catch (error) { addLog(`Error fetching products: ${error.message}`, 'error'); triggerFailsafe(`Failed to fetch products from Shopify`); return []; } } addLog(`Fetched ${allProducts.length} products.`, 'success'); return allProducts; }
 async function downloadAndExtractZip() { const res = await axios.get(`${config.ralawise.zipUrl}?t=${Date.now()}`, { responseType: 'arraybuffer' }); const tempDir = path.join(__dirname, 'temp', `ralawise_${Date.now()}`); fs.mkdirSync(tempDir, { recursive: true }); const zip = new AdmZip(res.data); zip.extractAllTo(tempDir, true); return { tempDir, csvFiles: fs.readdirSync(tempDir).filter(f => f.endsWith('.csv')).map(f => path.join(tempDir, f)) }; }
 
-// MODIFIED: Added logic to handle fulfillment service conflicts
+// FIXED: Handle fulfillment service conflicts
 async function updateInventoryWithREST(updates, runResult) {
     addLog(`Updating ${updates.length} items via REST API at location ${config.shopify.locationId}...`, 'info');
     syncProgress.inventory.total = updates.length;
     let processedItems = 0;
+    let fulfillmentServiceConflicts = 0;
 
     for (let i = 0; i < updates.length; i++) {
         if (syncProgress.inventory.cancelled) {
@@ -123,48 +124,80 @@ async function updateInventoryWithREST(updates, runResult) {
         }
 
         const update = updates[i];
+        let success = false;
+        
         try {
+            // First, try to connect the inventory item to our location
+            try {
+                await shopifyRequestWithRetry('post', '/inventory_levels/connect.json', {
+                    location_id: config.shopify.locationId,
+                    inventory_item_id: update.match.variant.inventory_item_id
+                });
+            } catch (connectError) {
+                // Ignore connect errors - item might already be connected
+            }
+
+            // Now try to set the inventory
             await shopifyRequestWithRetry('post', '/inventory_levels/set.json', {
                 location_id: config.shopify.locationId,
                 inventory_item_id: update.match.variant.inventory_item_id,
-                available: update.newQty
+                available: update.newQty,
+                disconnect_if_necessary: true  // This will disconnect from fulfillment service if needed
             });
             
             runResult.updated++;
             processedItems++;
+            success = true;
         } catch (e) {
-            const errorMsg = e.response?.data?.errors?.inventory_item_id?.[0] || e.response?.data?.errors || e.message;
-
-            // NEW: Handle the specific fulfillment service conflict
-            if (typeof errorMsg === 'string' && errorMsg.includes('fulfillment service location')) {
-                addLog(`Conflict for SKU ${update.sku}. Attempting to re-assign location...`, 'warning');
+            const errorMsg = e.response?.data?.errors || e.response?.data?.error || e.message;
+            
+            // If it's a fulfillment service conflict, try alternative approach
+            if (errorMsg && errorMsg.includes('fulfillment service')) {
+                fulfillmentServiceConflicts++;
+                
                 try {
-                    // Step 1: Connect the item to our target location. This tells Shopify we want to manage it here.
+                    // Get current inventory levels to find conflicting locations
+                    const levelsResponse = await shopifyRequestWithRetry('get', `/inventory_levels.json?inventory_item_ids=${update.match.variant.inventory_item_id}`);
+                    const levels = levelsResponse.data.inventory_levels || [];
+                    
+                    // Disconnect from other locations (especially fulfillment services)
+                    for (const level of levels) {
+                        if (level.location_id !== parseInt(config.shopify.locationId)) {
+                            try {
+                                await shopifyRequestWithRetry('delete', `/inventory_levels.json?inventory_item_id=${update.match.variant.inventory_item_id}&location_id=${level.location_id}`);
+                            } catch (disconnectError) {
+                                // Ignore disconnect errors
+                            }
+                        }
+                    }
+                    
+                    // Now connect to our location and set inventory
                     await shopifyRequestWithRetry('post', '/inventory_levels/connect.json', {
                         location_id: config.shopify.locationId,
-                        inventory_item_id: update.match.variant.inventory_item_id
+                        inventory_item_id: update.match.variant.inventory_item_id,
+                        relocate_if_necessary: true
                     });
-
-                    // Step 2: Retry setting the inventory level now that it's connected.
+                    
                     await shopifyRequestWithRetry('post', '/inventory_levels/set.json', {
                         location_id: config.shopify.locationId,
                         inventory_item_id: update.match.variant.inventory_item_id,
                         available: update.newQty
                     });
-
-                    addLog(`✅ Successfully re-assigned and updated SKU ${update.sku}`, 'success');
+                    
                     runResult.updated++;
                     processedItems++;
-
-                } catch (recoveryError) {
-                    const recoveryErrorMsg = recoveryError.response?.data?.errors || recoveryError.message;
-                    addLog(`Failed to re-assign SKU ${update.sku}: ${JSON.stringify(recoveryErrorMsg)}`, 'error');
+                    success = true;
+                } catch (retryError) {
+                    // Still failed after trying to handle fulfillment service conflict
+                    if (runResult.errors < 10) {
+                        addLog(`Failed to update SKU ${update.sku} (fulfillment conflict): ${retryError.response?.data?.errors || retryError.message}`, 'error');
+                    }
                     runResult.errors++;
                 }
             } else {
-                // It was a different error, so we log it as a failure.
+                // Other error types
                 if (runResult.errors < 10) {
-                    addLog(`Failed to update SKU ${update.sku}: ${JSON.stringify(errorMsg)}`, 'error');
+                    addLog(`Failed to update SKU ${update.sku}: ${errorMsg}`, 'error');
                 }
                 runResult.errors++;
             }
@@ -172,13 +205,14 @@ async function updateInventoryWithREST(updates, runResult) {
         
         updateProgress('inventory', i + 1, updates.length);
         
+        // Log progress every 100 items
         if ((i + 1) % 100 === 0 || i === updates.length - 1) {
-            addLog(`Progress: ${i + 1}/${updates.length} items processed (${processedItems} successful, ${runResult.errors} errors)`, 'info');
+            addLog(`Progress: ${i + 1}/${updates.length} items processed (${processedItems} successful, ${runResult.errors} errors, ${fulfillmentServiceConflicts} fulfillment conflicts)`, 'info');
         }
     }
     
     if (runResult.errors > 10) {
-        addLog(`Total of ${runResult.errors} items failed to update`, 'error');
+        addLog(`Total of ${runResult.errors} items failed to update (${fulfillmentServiceConflicts} were fulfillment service conflicts)`, 'error');
     }
 }
 
