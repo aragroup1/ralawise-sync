@@ -109,7 +109,7 @@ async function parseInventoryCSV(stream) { return new Promise((resolve, reject) 
 async function getAllShopifyProducts() { let allProducts = []; let url = `/products.json?limit=250&fields=id,handle,title,variants,tags,status`; addLog('Fetching all Shopify products...', 'info'); while (url) { try { const res = await shopifyRequestWithRetry('get', url); allProducts.push(...res.data.products); const linkHeader = res.headers.link; const nextLinkMatch = linkHeader ? linkHeader.match(/<([^>]+)>;\s*rel="next"/) : null; url = nextLinkMatch ? nextLinkMatch[1].replace(config.shopify.baseUrl, '') : null; } catch (error) { addLog(`Error fetching products: ${error.message}`, 'error'); triggerFailsafe(`Failed to fetch products from Shopify`); return []; } } addLog(`Fetched ${allProducts.length} products.`, 'success'); return allProducts; }
 async function downloadAndExtractZip() { const res = await axios.get(`${config.ralawise.zipUrl}?t=${Date.now()}`, { responseType: 'arraybuffer' }); const tempDir = path.join(__dirname, 'temp', `ralawise_${Date.now()}`); fs.mkdirSync(tempDir, { recursive: true }); const zip = new AdmZip(res.data); zip.extractAllTo(tempDir, true); return { tempDir, csvFiles: fs.readdirSync(tempDir).filter(f => f.endsWith('.csv')).map(f => path.join(tempDir, f)) }; }
 
-// FIXED: Using REST API for inventory updates instead of buggy GraphQL
+// MODIFIED: Added logic to handle fulfillment service conflicts
 async function updateInventoryWithREST(updates, runResult) {
     addLog(`Updating ${updates.length} items via REST API at location ${config.shopify.locationId}...`, 'info');
     syncProgress.inventory.total = updates.length;
@@ -124,7 +124,7 @@ async function updateInventoryWithREST(updates, runResult) {
 
         const update = updates[i];
         try {
-            const response = await shopifyRequestWithRetry('post', '/inventory_levels/set.json', {
+            await shopifyRequestWithRetry('post', '/inventory_levels/set.json', {
                 location_id: config.shopify.locationId,
                 inventory_item_id: update.match.variant.inventory_item_id,
                 available: update.newQty
@@ -133,17 +133,45 @@ async function updateInventoryWithREST(updates, runResult) {
             runResult.updated++;
             processedItems++;
         } catch (e) {
-            const errorMsg = e.response?.data?.errors || e.message;
-            // Only log first few errors to avoid spam
-            if (runResult.errors < 10) {
-                addLog(`Failed to update SKU ${update.sku}: ${errorMsg}`, 'error');
+            const errorMsg = e.response?.data?.errors?.inventory_item_id?.[0] || e.response?.data?.errors || e.message;
+
+            // NEW: Handle the specific fulfillment service conflict
+            if (typeof errorMsg === 'string' && errorMsg.includes('fulfillment service location')) {
+                addLog(`Conflict for SKU ${update.sku}. Attempting to re-assign location...`, 'warning');
+                try {
+                    // Step 1: Connect the item to our target location. This tells Shopify we want to manage it here.
+                    await shopifyRequestWithRetry('post', '/inventory_levels/connect.json', {
+                        location_id: config.shopify.locationId,
+                        inventory_item_id: update.match.variant.inventory_item_id
+                    });
+
+                    // Step 2: Retry setting the inventory level now that it's connected.
+                    await shopifyRequestWithRetry('post', '/inventory_levels/set.json', {
+                        location_id: config.shopify.locationId,
+                        inventory_item_id: update.match.variant.inventory_item_id,
+                        available: update.newQty
+                    });
+
+                    addLog(`✅ Successfully re-assigned and updated SKU ${update.sku}`, 'success');
+                    runResult.updated++;
+                    processedItems++;
+
+                } catch (recoveryError) {
+                    const recoveryErrorMsg = recoveryError.response?.data?.errors || recoveryError.message;
+                    addLog(`Failed to re-assign SKU ${update.sku}: ${JSON.stringify(recoveryErrorMsg)}`, 'error');
+                    runResult.errors++;
+                }
+            } else {
+                // It was a different error, so we log it as a failure.
+                if (runResult.errors < 10) {
+                    addLog(`Failed to update SKU ${update.sku}: ${JSON.stringify(errorMsg)}`, 'error');
+                }
+                runResult.errors++;
             }
-            runResult.errors++;
         }
         
         updateProgress('inventory', i + 1, updates.length);
         
-        // Log progress every 100 items
         if ((i + 1) % 100 === 0 || i === updates.length - 1) {
             addLog(`Progress: ${i + 1}/${updates.length} items processed (${processedItems} successful, ${runResult.errors} errors)`, 'info');
         }
