@@ -6,16 +6,25 @@ const path = require('path');
 const axios = require('axios');
 const multer = require('multer');
 const cron = require('node-cron');
+const AdmZip = require('adm-zip'); // NEW: Add to package.json
 const { Readable, Writable } = require('stream');
 require('dotenv').config();
 
 const app = express();
 app.use(express.json());
 
-// Setup file upload
+// Setup file upload - UPDATED to accept ZIP files
 const upload = multer({ 
     dest: path.join(__dirname, 'uploads/'),
-    limits: { fileSize: 200 * 1024 * 1024 } // 200MB limit
+    limits: { fileSize: 500 * 1024 * 1024 }, // Increased to 500MB for ZIP files
+    fileFilter: (req, file, cb) => {
+        const ext = path.extname(file.originalname).toLowerCase();
+        if (ext === '.csv' || ext === '.zip') {
+            cb(null, true);
+        } else {
+            cb(new Error('Only CSV and ZIP files are allowed'));
+        }
+    }
 });
 
 // ============================================
@@ -67,6 +76,7 @@ let isSystemPaused = false;
 const PAUSE_LOCK_FILE = path.join(__dirname, '_paused.lock');
 const HISTORY_FILE = path.join(__dirname, '_history.json');
 const UPLOADED_FILES_DIR = path.join(__dirname, 'uploaded_catalogs');
+const TEMP_EXTRACT_BASE = path.join(__dirname, 'temp_extract');
 let confirmation = { isAwaiting: false, message: '', details: {}, proceedAction: null, abortAction: null, jobKey: null };
 let runHistory = [];
 let syncProgress = { 
@@ -81,6 +91,7 @@ let discontinuedProducts = new Set(); // Track discontinued SKUs
 // Create directories if they don't exist
 if (!fs.existsSync(UPLOADED_FILES_DIR)) fs.mkdirSync(UPLOADED_FILES_DIR, { recursive: true });
 if (!fs.existsSync(path.join(__dirname, 'uploads'))) fs.mkdirSync(path.join(__dirname, 'uploads'), { recursive: true });
+if (!fs.existsSync(TEMP_EXTRACT_BASE)) fs.mkdirSync(TEMP_EXTRACT_BASE, { recursive: true });
 
 class RateLimiter { constructor(rps=2,bs=40){this.rps=rps;this.bs=bs;this.tokens=bs;this.lastRefill=Date.now();this.queue=[];this.processing=false}async acquire(){return new Promise(r=>{this.queue.push(r);this.process()})}async process(){if(this.processing)return;this.processing=true;while(this.queue.length>0){const n=Date.now();const p=(n-this.lastRefill)/1000;this.tokens=Math.min(this.bs,this.tokens+p*this.rps);this.lastRefill=n;if(this.tokens>=1){this.tokens--;const r=this.queue.shift();r()}else{const w=(1/this.rps)*1000;await new Promise(r=>setTimeout(r,w))}}this.processing=false}}
 const rateLimiter = new RateLimiter(config.rateLimit.requestsPerSecond, config.rateLimit.burstSize);
@@ -121,6 +132,108 @@ function requestConfirmation(jobKey, message, details, proceedAction) {
 }
 
 // ============================================
+// NEW ZIP HANDLING FUNCTIONS
+// ============================================
+
+async function extractAndProcessZip(zipPath) {
+    const extractDir = path.join(TEMP_EXTRACT_BASE, Date.now().toString());
+    const csvFiles = [];
+    
+    try {
+        // Create extraction directory
+        fs.mkdirSync(extractDir, { recursive: true });
+        
+        // Extract ZIP
+        const zip = new AdmZip(zipPath);
+        zip.extractAllTo(extractDir, true);
+        addLog(`Extracting ZIP file to ${extractDir}`, 'info');
+        
+        // Find all CSV files recursively
+        function findCSVFiles(dir) {
+            const files = fs.readdirSync(dir);
+            
+            for (const file of files) {
+                const fullPath = path.join(dir, file);
+                const stat = fs.statSync(fullPath);
+                
+                if (stat.isDirectory()) {
+                    findCSVFiles(fullPath);
+                } else if (file.toLowerCase().endsWith('.csv')) {
+                    csvFiles.push(fullPath);
+                }
+            }
+        }
+        
+        findCSVFiles(extractDir);
+        addLog(`Found ${csvFiles.length} CSV files in ZIP`, 'info');
+        
+        return { csvFiles, extractDir };
+    } catch (error) {
+        // Clean up on error
+        if (fs.existsSync(extractDir)) {
+            fs.rmSync(extractDir, { recursive: true, force: true });
+        }
+        throw error;
+    }
+}
+
+async function combineCSVFiles(csvFiles) {
+    const combinedProducts = [];
+    const discontinuedItems = [];
+    
+    for (const csvFile of csvFiles) {
+        const fileName = path.basename(csvFile).toLowerCase();
+        
+        // Check if this is a discontinued items file
+        const isDiscontinued = fileName.includes('discontinue') || 
+                              fileName.includes('discontinued') || 
+                              fileName.includes('end_of_line') ||
+                              fileName.includes('end-of-line');
+        
+        await new Promise((resolve, reject) => {
+            fs.createReadStream(csvFile)
+                .pipe(csv())
+                .on('data', (row) => {
+                    if (isDiscontinued) {
+                        discontinuedItems.push(row);
+                    } else {
+                        combinedProducts.push(row);
+                    }
+                })
+                .on('end', () => {
+                    const rowType = isDiscontinued ? 'discontinued' : 'product';
+                    addLog(`Processed ${fileName}: ${rowType} file`, 'info');
+                    resolve();
+                })
+                .on('error', reject);
+        });
+    }
+    
+    return { combinedProducts, discontinuedItems };
+}
+
+async function saveAsCSV(rows, filePath) {
+    if (rows.length === 0) return;
+    
+    const headers = Object.keys(rows[0]);
+    const csvContent = [
+        headers.join(','),
+        ...rows.map(row => 
+            headers.map(header => {
+                const value = row[header] || '';
+                // Escape values containing commas or quotes
+                if (value.toString().includes(',') || value.toString().includes('"')) {
+                    return `"${value.toString().replace(/"/g, '""')}"`;
+                }
+                return value;
+            }).join(',')
+        )
+    ].join('\n');
+    
+    fs.writeFileSync(filePath, csvContent);
+}
+
+// ============================================
 // CORE LOGIC
 // ============================================
 
@@ -128,7 +241,7 @@ async function fetchInventoryFromFTP() { const client = new ftp.Client(); try { 
 async function parseInventoryCSV(stream) { return new Promise((resolve, reject) => { const inventory = new Map(); stream.pipe(csv({ headers: ['SKU', 'Quantity'], skipLines: 1 })).on('data', row => { if (row.SKU) inventory.set(row.SKU.trim(), Math.min(parseInt(row.Quantity) || 0, config.ralawise.maxInventory)); }).on('end', () => resolve(inventory)).on('error', reject); }); }
 async function getAllShopifyProducts() { let allProducts = []; let url = `/products.json?limit=250&fields=id,handle,title,variants,tags,status`; addLog('Fetching all Shopify products...', 'info'); while (url) { try { const res = await shopifyRequestWithRetry('get', url); allProducts.push(...res.data.products); const linkHeader = res.headers.link; const nextLinkMatch = linkHeader ? linkHeader.match(/<([^>]+)>;\s*rel="next"/) : null; url = nextLinkMatch ? nextLinkMatch[1].replace(config.shopify.baseUrl, '') : null; } catch (error) { addLog(`Error fetching products: ${error.message}`, 'error'); triggerFailsafe(`Failed to fetch products from Shopify`); return []; } } addLog(`Fetched ${allProducts.length} products.`, 'success'); return allProducts; }
 
-// NEW: Parse discontinued CSV with stock information
+// Parse discontinued CSV with stock information
 async function parseDiscontinuedCSV(filePath) {
     return new Promise((resolve, reject) => {
         const discontinued = new Map();
@@ -163,7 +276,7 @@ async function parseDiscontinuedCSV(filePath) {
     });
 }
 
-// NEW: Get latest uploaded catalog files
+// Get latest uploaded catalog files
 function getLatestCatalogFiles() {
     try {
         if (!fs.existsSync(UPLOADED_FILES_DIR)) return null;
@@ -177,8 +290,13 @@ function getLatestCatalogFiles() {
             }))
             .sort((a, b) => b.uploadTime - a.uploadTime);
         
-        const productFile = files.find(f => f.name.toLowerCase().includes('product') && !f.name.toLowerCase().includes('discontinue'));
-        const discontinuedFile = files.find(f => f.name.toLowerCase().includes('discontinue'));
+        const productFile = files.find(f => 
+            (f.name.toLowerCase().includes('product') || f.name.toLowerCase().includes('combined_products')) 
+            && !f.name.toLowerCase().includes('discontinue')
+        );
+        const discontinuedFile = files.find(f => 
+            f.name.toLowerCase().includes('discontinue') || f.name.toLowerCase().includes('combined_discontinued')
+        );
         
         return { productFile, discontinuedFile, allFiles: files };
     } catch (e) {
@@ -513,7 +631,7 @@ async function processFullImport() {
     }
 }
 
-// NEW: One-off cleanup function
+// One-off cleanup function
 async function cleanupProductsWithoutSupplierTags() {
     if (isRunning.cleanup) return;
     isRunning.cleanup = true;
@@ -644,14 +762,16 @@ async function sendWeeklyReport() {
 }
 
 // ============================================
-// SYNC WRAPPERS & API
+// SYNC WRAPPERS & API - UPDATED WITH ZIP SUPPORT
 // ============================================
 
 async function syncInventory() { if (isSystemLocked()) return; try { await updateInventoryBySKU(await parseInventoryCSV(await fetchInventoryFromFTP())); } catch (error) { triggerFailsafe(`Inventory sync failed: ${error.message}`); } }
 async function syncFullCatalog() { if (isSystemLocked()) return; try { await processFullImport(); } catch (error) { triggerFailsafe(`Full catalog sync failed: ${error.message}`); } }
 
-// File upload endpoints
+// UPDATED File upload endpoint with ZIP support
 app.post('/api/upload/catalog', upload.array('files', 10), async (req, res) => {
+    let tempExtractDirs = [];
+    
     try {
         if (!req.files || req.files.length === 0) {
             return res.status(400).json({ error: 'No files uploaded' });
@@ -664,18 +784,96 @@ app.post('/api/upload/catalog', upload.array('files', 10), async (req, res) => {
             });
         }
         
-        // Move uploaded files to permanent location
-        req.files.forEach(file => {
-            const destPath = path.join(UPLOADED_FILES_DIR, file.originalname);
-            fs.renameSync(file.path, destPath);
-            addLog(`Uploaded file: ${file.originalname} (${(file.size / 1024 / 1024).toFixed(2)} MB)`, 'success');
-        });
+        let allProductRows = [];
+        let allDiscontinuedRows = [];
+        let processedFiles = [];
+        
+        for (const file of req.files) {
+            const ext = path.extname(file.originalname).toLowerCase();
+            
+            if (ext === '.zip') {
+                // Handle ZIP file
+                addLog(`Processing ZIP file: ${file.originalname}`, 'info');
+                const { csvFiles, extractDir } = await extractAndProcessZip(file.path);
+                tempExtractDirs.push(extractDir);
+                
+                const { combinedProducts, discontinuedItems } = await combineCSVFiles(csvFiles);
+                allProductRows.push(...combinedProducts);
+                allDiscontinuedRows.push(...discontinuedItems);
+                
+                processedFiles.push({
+                    name: file.originalname,
+                    type: 'ZIP',
+                    csvCount: csvFiles.length,
+                    productRows: combinedProducts.length,
+                    discontinuedRows: discontinuedItems.length
+                });
+                
+                // Clean up uploaded ZIP
+                fs.unlinkSync(file.path);
+                
+            } else if (ext === '.csv') {
+                // Handle regular CSV file
+                const destPath = path.join(UPLOADED_FILES_DIR, file.originalname);
+                fs.renameSync(file.path, destPath);
+                
+                // Check if it's a discontinued file
+                if (file.originalname.toLowerCase().includes('discontinue')) {
+                    processedFiles.push({
+                        name: file.originalname,
+                        type: 'CSV (Discontinued)',
+                        size: file.size
+                    });
+                } else {
+                    processedFiles.push({
+                        name: file.originalname,
+                        type: 'CSV (Products)',
+                        size: file.size
+                    });
+                }
+                
+                addLog(`Uploaded CSV file: ${file.originalname} (${(file.size / 1024 / 1024).toFixed(2)} MB)`, 'success');
+            }
+        }
+        
+        // If we have combined data from ZIP files, save them as consolidated CSV files
+        if (allProductRows.length > 0) {
+            const combinedProductPath = path.join(UPLOADED_FILES_DIR, `combined_products_${Date.now()}.csv`);
+            await saveAsCSV(allProductRows, combinedProductPath);
+            addLog(`Created combined product file with ${allProductRows.length} rows`, 'success');
+        }
+        
+        if (allDiscontinuedRows.length > 0) {
+            const combinedDiscontinuedPath = path.join(UPLOADED_FILES_DIR, `combined_discontinued_${Date.now()}.csv`);
+            await saveAsCSV(allDiscontinuedRows, combinedDiscontinuedPath);
+            addLog(`Created combined discontinued file with ${allDiscontinuedRows.length} rows`, 'success');
+        }
+        
+        // Clean up temporary extraction directories
+        for (const dir of tempExtractDirs) {
+            if (fs.existsSync(dir)) {
+                fs.rmSync(dir, { recursive: true, force: true });
+            }
+        }
         
         res.json({ 
             success: true, 
-            files: req.files.map(f => ({ name: f.originalname, size: f.size }))
+            files: processedFiles,
+            summary: {
+                totalProductRows: allProductRows.length,
+                totalDiscontinuedRows: allDiscontinuedRows.length,
+                filesProcessed: processedFiles.length
+            }
         });
+        
     } catch (error) {
+        // Clean up on error
+        for (const dir of tempExtractDirs) {
+            if (fs.existsSync(dir)) {
+                fs.rmSync(dir, { recursive: true, force: true });
+            }
+        }
+        
         addLog(`Upload failed: ${error.message}`, 'error');
         res.status(500).json({ error: error.message });
     }
@@ -704,7 +902,7 @@ app.get('/api/changes/latest', (req, res) => { res.json(inventoryChangeLog); });
 const isSystemLocked = () => isRunning.inventory || isRunning.fullImport || isRunning.cleanup || isSystemPaused || failsafe.isTriggered || confirmation.isAwaiting;
 
 // ============================================
-// WEB INTERFACE
+// WEB INTERFACE - UPDATED WITH ZIP SUPPORT
 // ============================================
 
 app.get('/', (req, res) => {
@@ -735,13 +933,15 @@ app.get('/', (req, res) => {
             <h2>Full Catalog Import</h2>
             <p>Status: ${isRunning.fullImport?'Running':'Ready'}</p>
             <div class="file-upload">
-                <label for="file-input" class="btn">📁 Upload CSV Files</label>
-                <input type="file" id="file-input" multiple accept=".csv" onchange="uploadFiles(this.files)">
+                <label for="file-input" class="btn">📁 Upload CSV/ZIP Files</label>
+                <input type="file" id="file-input" multiple accept=".csv,.zip" onchange="uploadFiles(this.files)">
                 <div class="upload-status">
+                    <div id="upload-progress"></div>
                     ${catalogFiles?.productFile ? `✅ Product: ${catalogFiles.productFile.name}` : '❌ No product file'}
                     ${catalogFiles?.discontinuedFile ? `<br>✅ Discontinued: ${catalogFiles.discontinuedFile.name}` : '<br>⚠️ No discontinued file (optional)'}
                     ${catalogFiles?.productFile ? `<br>📅 Uploaded: ${new Date(catalogFiles.productFile.uploadTime).toLocaleString()}` : ''}
                 </div>
+                <div style="font-size:0.8em;color:#8b949e;margin-top:0.5rem;">Accepts: CSV files or ZIP archives containing multiple CSV files</div>
             </div>
             <button onclick="apiPost('/api/sync/full','Create/discontinue products?')" class="btn" ${isSystemLocked() || !catalogFiles?.productFile ?'disabled':''} style="margin-top:0.5rem;">Run Import</button>
         </div>
@@ -755,7 +955,41 @@ app.get('/', (req, res) => {
     <div class="card"><h2>Logs</h2><div class="logs">${logs.map(log=>`<div class="log-entry log-${log.type}">[${new Date(log.timestamp).toLocaleTimeString()}] ${log.message}</div>`).join('')}</div></div>
     </div><script>
     async function apiPost(url,confirmMsg){if(confirmMsg&&!confirm(confirmMsg))return;try{const btn=event.target;if(btn)btn.disabled=true;await fetch(url,{method:'POST'});setTimeout(()=>location.reload(),500)}catch(e){alert(e.message);if(btn)btn.disabled=false;}}
-    async function uploadFiles(files){if(!files||files.length===0)return;const formData=new FormData();for(let file of files){formData.append('files',file);}try{const btn=document.querySelector('label[for="file-input"]');btn.textContent='Uploading...';const res=await fetch('/api/upload/catalog',{method:'POST',body:formData});const data=await res.json();if(data.success){alert('Files uploaded successfully!');location.reload();}else{alert('Upload failed: '+data.error);}}catch(e){alert('Upload error: '+e.message);}}
+    async function uploadFiles(files){
+        if(!files||files.length===0)return;
+        const formData=new FormData();
+        let totalSize=0;
+        for(let file of files){formData.append('files',file);totalSize+=file.size;}
+        const progressDiv=document.getElementById('upload-progress');
+        progressDiv.innerHTML='Uploading '+files.length+' file(s) ('+(totalSize/1024/1024).toFixed(2)+' MB)...';
+        try{
+            const btn=document.querySelector('label[for="file-input"]');
+            btn.textContent='Uploading...';
+            btn.style.opacity='0.5';
+            const res=await fetch('/api/upload/catalog',{method:'POST',body:formData});
+            const data=await res.json();
+            if(data.success){
+                let message='Files uploaded successfully!\\n\\n';
+                if(data.summary){
+                    message+='Products: '+data.summary.totalProductRows+' rows\\n';
+                    message+='Discontinued: '+data.summary.totalDiscontinuedRows+' rows\\n';
+                    message+='Files processed: '+data.summary.filesProcessed;
+                }
+                alert(message);
+                location.reload();
+            }else{
+                alert('Upload failed: '+data.error);
+                btn.textContent='📁 Upload CSV/ZIP Files';
+                btn.style.opacity='1';
+                progressDiv.innerHTML='';
+            }
+        }catch(e){
+            alert('Upload error: '+e.message);
+            document.querySelector('label[for="file-input"]').textContent='📁 Upload CSV/ZIP Files';
+            document.querySelector('label[for="file-input"]').style.opacity='1';
+            progressDiv.innerHTML='';
+        }
+    }
     </script></body></html>`;
     res.send(html);
 });
