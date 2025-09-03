@@ -1,25 +1,25 @@
 {
-  "name": "ralawise-shopify-sync",
+  "name": "ralawise-sync",
   "version": "1.0.0",
-  "description": "Sync Ralawise inventory and products to Shopify",
+  "description": "Ralawise inventory sync application for Railway",
   "main": "ralawise-sync.js",
   "scripts": {
     "start": "node ralawise-sync.js",
     "dev": "nodemon ralawise-sync.js"
   },
-  "engines": {
-    "node": ">=14.0.0"
-  },
   "dependencies": {
     "express": "^4.18.2",
-    "axios": "^1.5.0",
-    "basic-ftp": "^5.0.3",
+    "basic-ftp": "^5.0.4",
     "csv-parser": "^3.0.0",
-    "adm-zip": "^0.5.10",
-    "node-cron": "^3.0.2",
+    "axios": "^1.6.2",
+    "multer": "^1.4.5",
+    "node-cron": "^3.0.3",
     "dotenv": "^16.3.1"
   },
   "devDependencies": {
-    "nodemon": "^3.0.1"
+    "nodemon": "^3.0.2"
+  },
+  "engines": {
+    "node": ">=18.0.0"
   }
 }
