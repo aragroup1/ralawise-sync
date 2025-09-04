@@ -151,7 +151,6 @@ async function extractUploadedFiles(uploadedFile, targetDir) {
         const filePath = uploadedFile.path;
         const originalName = uploadedFile.originalname.toLowerCase();
         
-        // Clear existing files in target directory
         if (fs.existsSync(targetDir)) {
             fs.readdirSync(targetDir).forEach(file => {
                 const fullPath = path.join(targetDir, file);
@@ -163,72 +162,47 @@ async function extractUploadedFiles(uploadedFile, targetDir) {
             });
         }
         
-        // Check if it's a ZIP file
         if (originalName.endsWith('.zip')) {
             addLog(`Extracting ZIP file: ${originalName}`, 'info');
+            const zip = new AdmZip(filePath);
+            const tempExtractDir = path.join(targetDir, 'extracted');
+            zip.extractAllTo(tempExtractDir, true);
             
-            try {
-                const zip = new AdmZip(filePath);
-                const tempExtractDir = path.join(targetDir, 'extracted');
-                
-                // Extract all files
-                zip.extractAllTo(tempExtractDir, true);
-                
-                // Find all CSV files recursively
-                const findCSVFiles = (dir) => {
-                    let csvFiles = [];
-                    const files = fs.readdirSync(dir);
-                    
-                    for (const file of files) {
-                        const fullPath = path.join(dir, file);
-                        const stat = fs.statSync(fullPath);
-                        
-                        if (stat.isDirectory()) {
-                            csvFiles = csvFiles.concat(findCSVFiles(fullPath));
-                        } else if (file.toLowerCase().endsWith('.csv')) {
-                            csvFiles.push(fullPath);
-                        }
+            const findCSVFiles = (dir) => {
+                let csvFiles = [];
+                fs.readdirSync(dir).forEach(file => {
+                    const fullPath = path.join(dir, file);
+                    if (fs.statSync(fullPath).isDirectory()) {
+                        csvFiles = csvFiles.concat(findCSVFiles(fullPath));
+                    } else if (file.toLowerCase().endsWith('.csv')) {
+                        csvFiles.push(fullPath);
                     }
-                    
-                    return csvFiles;
-                };
-                
-                const csvFiles = findCSVFiles(tempExtractDir);
-                addLog(`Found ${csvFiles.length} CSV files in ZIP`, 'info');
-                
-                // Move CSV files to target directory
-                csvFiles.forEach((csvPath, index) => {
-                    const fileName = path.basename(csvPath);
-                    const destName = csvFiles.length > 1 ? `file_${index + 1}_${fileName}` : fileName;
-                    const destPath = path.join(targetDir, destName);
-                    fs.copyFileSync(csvPath, destPath);
-                    addLog(`Extracted: ${fileName}`, 'success');
                 });
-                
-                // Clean up temp directory
-                fs.rmSync(tempExtractDir, { recursive: true, force: true });
-                
-                // Clean up uploaded file
-                fs.unlinkSync(filePath);
-                
-                return { success: true, fileCount: csvFiles.length };
-                
-            } catch (zipError) {
-                addLog(`ZIP extraction failed: ${zipError.message}`, 'error');
-                throw zipError;
-            }
+                return csvFiles;
+            };
             
+            const csvFiles = findCSVFiles(tempExtractDir);
+            addLog(`Found ${csvFiles.length} CSV files in ZIP`, 'info');
+            
+            csvFiles.forEach((csvPath, index) => {
+                const fileName = path.basename(csvPath);
+                const destName = csvFiles.length > 1 ? `file_${index + 1}_${fileName}` : fileName;
+                const destPath = path.join(targetDir, destName);
+                fs.copyFileSync(csvPath, destPath);
+                addLog(`Extracted: ${fileName}`, 'success');
+            });
+            
+            fs.rmSync(tempExtractDir, { recursive: true, force: true });
+            fs.unlinkSync(filePath);
+            return { success: true, fileCount: csvFiles.length };
         } else if (originalName.endsWith('.csv')) {
-            // Single CSV file - just move it
             const destPath = path.join(targetDir, originalName);
             fs.renameSync(filePath, destPath);
             addLog(`Uploaded CSV: ${originalName}`, 'success');
             return { success: true, fileCount: 1 };
-            
         } else {
             throw new Error('Invalid file type. Please upload ZIP or CSV files.');
         }
-        
     } catch (error) {
         addLog(`File processing error: ${error.message}`, 'error');
         throw error;
@@ -241,39 +215,27 @@ async function parseDiscontinuedCSV(filePath, shopifyProducts) {
         const discontinued = new Map();
         const skuToInventory = new Map();
         
-        // Build SKU to inventory map from Shopify products
         shopifyProducts.forEach(p => {
             p.variants?.forEach(v => {
-                if (v.sku) {
-                    skuToInventory.set(v.sku.toUpperCase(), v.inventory_quantity || 0);
-                }
+                if (v.sku) skuToInventory.set(v.sku.toUpperCase(), v.inventory_quantity || 0);
             });
         });
         
-        fs.createReadStream(filePath)
-            .pipe(csv())
-            .on('data', row => {
-                // Look for SKU Code column
-                const sku = row['Sku Code'] || row['SKU'] || row['Variant SKU'] || row['Product Code'] || '';
-                
-                if (sku) {
-                    const upperSKU = sku.trim().toUpperCase();
-                    const currentStock = skuToInventory.get(upperSKU) || 0;
-                    
-                    discontinued.set(upperSKU, {
-                        sku: sku.trim(),
-                        currentStock: currentStock,
-                        shouldDiscontinue: currentStock <= config.ralawise.discontinuedStockThreshold
-                    });
-                }
-            })
-            .on('end', () => {
-                addLog(`Parsed ${discontinued.size} discontinued items`, 'info');
-                addLog(`Items to discontinue (stock ≤ ${config.ralawise.discontinuedStockThreshold}): ${Array.from(discontinued.values()).filter(d => d.shouldDiscontinue).length}`, 'info');
-                addLog(`Items to keep (stock > ${config.ralawise.discontinuedStockThreshold}): ${Array.from(discontinued.values()).filter(d => !d.shouldDiscontinue).length}`, 'info');
-                resolve(discontinued);
-            })
-            .on('error', reject);
+        fs.createReadStream(filePath).pipe(csv()).on('data', row => {
+            const sku = row['Sku Code'] || row['SKU'] || row['Variant SKU'] || row['Product Code'] || '';
+            if (sku) {
+                const upperSKU = sku.trim().toUpperCase();
+                const currentStock = skuToInventory.get(upperSKU) || 0;
+                discontinued.set(upperSKU, {
+                    sku: sku.trim(),
+                    currentStock: currentStock,
+                    shouldDiscontinue: currentStock <= config.ralawise.discontinuedStockThreshold
+                });
+            }
+        }).on('end', () => {
+            addLog(`Parsed ${discontinued.size} discontinued items`, 'info');
+            resolve(discontinued);
+        }).on('error', reject);
     });
 }
 
@@ -281,26 +243,20 @@ async function parseDiscontinuedCSV(filePath, shopifyProducts) {
 function getLatestCatalogFiles() {
     try {
         const productFiles = fs.existsSync(UPLOADED_FILES_DIR) ? 
-            fs.readdirSync(UPLOADED_FILES_DIR)
-                .filter(f => f.endsWith('.csv'))
-                .map(f => ({
-                    name: f,
-                    path: path.join(UPLOADED_FILES_DIR, f),
-                    uploadTime: fs.statSync(path.join(UPLOADED_FILES_DIR, f)).mtime,
-                    size: fs.statSync(path.join(UPLOADED_FILES_DIR, f)).size
-                }))
-                .sort((a, b) => b.uploadTime - a.uploadTime) : [];
+            fs.readdirSync(UPLOADED_FILES_DIR).filter(f => f.endsWith('.csv')).map(f => ({
+                name: f,
+                path: path.join(UPLOADED_FILES_DIR, f),
+                uploadTime: fs.statSync(path.join(UPLOADED_FILES_DIR, f)).mtime,
+                size: fs.statSync(path.join(UPLOADED_FILES_DIR, f)).size
+            })).sort((a, b) => b.uploadTime - a.uploadTime) : [];
         
         const discontinuedFiles = fs.existsSync(DISCONTINUED_FILES_DIR) ? 
-            fs.readdirSync(DISCONTINUED_FILES_DIR)
-                .filter(f => f.endsWith('.csv'))
-                .map(f => ({
-                    name: f,
-                    path: path.join(DISCONTINUED_FILES_DIR, f),
-                    uploadTime: fs.statSync(path.join(DISCONTINUED_FILES_DIR, f)).mtime,
-                    size: fs.statSync(path.join(DISCONTINUED_FILES_DIR, f)).size
-                }))
-                .sort((a, b) => b.uploadTime - a.uploadTime) : [];
+            fs.readdirSync(DISCONTINUED_FILES_DIR).filter(f => f.endsWith('.csv')).map(f => ({
+                name: f,
+                path: path.join(DISCONTINUED_FILES_DIR, f),
+                uploadTime: fs.statSync(path.join(DISCONTINUED_FILES_DIR, f)).mtime,
+                size: fs.statSync(path.join(DISCONTINUED_FILES_DIR, f)).size
+            })).sort((a, b) => b.uploadTime - a.uploadTime) : [];
         
         return { 
             productFiles,
@@ -314,7 +270,7 @@ function getLatestCatalogFiles() {
     }
 }
 
-// SEPARATED: Process new products/updates ONLY (no discontinuation)
+// SEPARATED: Process new products/updates ONLY
 async function processProductImport() {
     if (isRunning.fullImport) return; 
     isRunning.fullImport = true;
@@ -337,38 +293,27 @@ async function processProductImport() {
             throw new Error('No product catalog files found. Please upload product CSV or ZIP files first.');
         }
         
-        addLog(`Using ${catalogFiles.productFiles.length} product file(s), total size: ${(catalogFiles.totalProductSize / 1024 / 1024).toFixed(2)} MB`, 'info');
+        addLog(`Using ${catalogFiles.productFiles.length} product file(s)`, 'info');
         
         const shopifyProducts = await getAllShopifyProducts();
         
         const allRows = [];
         let totalRowCount = 0;
         
-        for (let i = 0; i < catalogFiles.productFiles.length; i++) {
-            const file = catalogFiles.productFiles[i];
-            addLog(`Reading file ${i + 1}/${catalogFiles.productFiles.length}: ${file.name}`, 'info');
-            
+        for (const file of catalogFiles.productFiles) {
             const rows = await new Promise((res, rej) => { 
                 const p = []; 
-                fs.createReadStream(file.path)
-                    .pipe(csv())
-                    .on('data', r => {
-                        totalRowCount++;
-                        p.push(r);
-                    })
-                    .on('end', () => res(p))
-                    .on('error', rej); 
+                fs.createReadStream(file.path).pipe(csv()).on('data', r => {
+                    totalRowCount++;
+                    p.push(r);
+                }).on('end', () => res(p)).on('error', rej); 
             });
-            
             allRows.push(...rows);
-            addLog(`  Loaded ${rows.length} rows from ${file.name}`, 'info');
         }
         
         addLog(`Total rows loaded: ${totalRowCount}`, 'info');
         
-        if (totalRowCount === 0) {
-            throw new Error('No data found in uploaded files. Please check the CSV format.');
-        }
+        if (totalRowCount === 0) throw new Error('No data found in uploaded files.');
         
         const productsByBaseSKU = new Map();
         let skippedRows = 0;
@@ -383,23 +328,14 @@ async function processProductImport() {
             const baseSKU = getBaseSKU(variantSKU);
             
             if (!productsByBaseSKU.has(baseSKU)) {
-                // FIXED: Clean the title - remove the variant option from the main title
                 let cleanTitle = row.Title;
-                if (row['Option1 Value']) {
-                    cleanTitle = cleanTitle.replace(new RegExp(`^${row['Option1 Value']} - `), '');
-                }
+                if (row['Option1 Value']) cleanTitle = cleanTitle.replace(new RegExp(`^${row['Option1 Value']} - `), '');
                 
                 const handle = generateHandle(baseSKU, cleanTitle);
                 productsByBaseSKU.set(baseSKU, {
-                    title: cleanTitle,
-                    handle: handle,
-                    body_html: row['Body (HTML)'],
-                    vendor: row.Vendor,
-                    product_type: row['Type'],
-                    tags: `${row.Tags || ''},Supplier:Ralawise`.replace(/^,/, ''),
-                    images: [],
-                    variants: [],
-                    options: []
+                    title: cleanTitle, handle, body_html: row['Body (HTML)'], vendor: row.Vendor,
+                    product_type: row['Type'], tags: `${row.Tags || ''},Supplier:Ralawise`.replace(/^,/, ''),
+                    images: [], variants: [], options: []
                 });
             }
             
@@ -409,53 +345,31 @@ async function processProductImport() {
                 product.images.push({ src: row['Image Src'] });
             }
             
-            const variant = {
-                sku: variantSKU,
-                price: applyRalawisePricing(parseFloat(row['Variant Price'])),
+            product.variants.push({
+                sku: variantSKU, price: applyRalawisePricing(parseFloat(row['Variant Price'])),
                 compare_at_price: row['Variant Compare At Price'] || null,
-                option1: row['Option1 Value'] || null,
-                option2: row['Option2 Value'] || null,
-                option3: row['Option3 Value'] || null,
+                option1: row['Option1 Value'] || null, option2: row['Option2 Value'] || null, option3: row['Option3 Value'] || null,
                 inventory_quantity: Math.min(parseInt(row['Variant Inventory Qty']) || 0, config.ralawise.maxInventory),
-                weight: parseFloat(row['Variant Grams']) || 0,
-                weight_unit: 'g',
-                inventory_management: 'shopify',
-                fulfillment_service: 'manual',
-                barcode: row['Variant Barcode'] || null
-            };
+                weight: parseFloat(row['Variant Grams']) || 0, weight_unit: 'g', inventory_management: 'shopify',
+                fulfillment_service: 'manual', barcode: row['Variant Barcode'] || null
+            });
             
-            product.variants.push(variant);
-            
-            if (row['Option1 Name'] && !product.options.some(o => o.name === row['Option1 Name'])) {
-                product.options.push({ name: row['Option1 Name'], position: 1, values: [] });
-            }
-            if (row['Option2 Name'] && !product.options.some(o => o.name === row['Option2 Name'])) {
-                product.options.push({ name: row['Option2 Name'], position: 2, values: [] });
-            }
-            if (row['Option3 Name'] && !product.options.some(o => o.name === row['Option3 Name'])) {
-                product.options.push({ name: row['Option3 Name'], position: 3, values: [] });
-            }
+            if (row['Option1 Name'] && !product.options.some(o => o.name === row['Option1 Name'])) product.options.push({ name: row['Option1 Name'], position: 1, values: [] });
+            if (row['Option2 Name'] && !product.options.some(o => o.name === row['Option2 Name'])) product.options.push({ name: row['Option2 Name'], position: 2, values: [] });
+            if (row['Option3 Name'] && !product.options.some(o => o.name === row['Option3 Name'])) product.options.push({ name: row['Option3 Name'], position: 3, values: [] });
         }
         
         productsByBaseSKU.forEach(product => {
             product.variants.forEach(variant => {
-                if (variant.option1 && product.options[0] && !product.options[0].values.includes(variant.option1)) {
-                    product.options[0].values.push(variant.option1);
-                }
-                if (variant.option2 && product.options[1] && !product.options[1].values.includes(variant.option2)) {
-                    product.options[1].values.push(variant.option2);
-                }
-                if (variant.option3 && product.options[2] && !product.options[2].values.includes(variant.option3)) {
-                    product.options[2].values.push(variant.option3);
-                }
+                if (variant.option1 && product.options[0] && !product.options[0].values.includes(variant.option1)) product.options[0].values.push(variant.option1);
+                if (variant.option2 && product.options[1] && !product.options[1].values.includes(variant.option2)) product.options[1].values.push(variant.option2);
+                if (variant.option3 && product.options[2] && !product.options[2].values.includes(variant.option3)) product.options[2].values.push(variant.option3);
             });
         });
         
         addLog(`Grouped into ${productsByBaseSKU.size} unique products (skipped ${skippedRows} rows without SKU)`, 'info');
         
-        if (productsByBaseSKU.size === 0) {
-            throw new Error('No valid products found after grouping. Please check if CSV has "Variant SKU" column.');
-        }
+        if (productsByBaseSKU.size === 0) throw new Error('No valid products found after grouping.');
         
         const existingProductsByBaseSKU = new Map();
         const existingProductsByHandle = new Map();
@@ -464,21 +378,16 @@ async function processProductImport() {
             p.variants?.forEach(v => {
                 if (v.sku) {
                     const baseSKU = getBaseSKU(v.sku);
-                    if (baseSKU && !existingProductsByBaseSKU.has(baseSKU)) {
-                        existingProductsByBaseSKU.set(baseSKU, p);
-                    }
+                    if (baseSKU && !existingProductsByBaseSKU.has(baseSKU)) existingProductsByBaseSKU.set(baseSKU, p);
                 }
             });
-            if (p.handle) {
-                existingProductsByHandle.set(p.handle, p);
-            }
+            if (p.handle) existingProductsByHandle.set(p.handle, p);
         });
         
         let processedCount = 0;
         for (const [baseSKU, productData] of productsByBaseSKU) {
             try {
-                let existingProduct = existingProductsByBaseSKU.get(baseSKU) || 
-                                     existingProductsByHandle.get(productData.handle);
+                let existingProduct = existingProductsByBaseSKU.get(baseSKU) || existingProductsByHandle.get(productData.handle);
                 
                 if (existingProduct) {
                     addLog(`Updating existing product: ${existingProduct.title} (${baseSKU})`, 'info');
@@ -491,23 +400,10 @@ async function processProductImport() {
                         if (v.sku) existingVariantsBySKU.set(v.sku.toUpperCase(), v);
                     });
                     
-                    const variantsToAdd = productData.variants.filter(v => 
-                        !existingVariantsBySKU.has(v.sku.toUpperCase())
-                    );
+                    const variantsToAdd = productData.variants.filter(v => !existingVariantsBySKU.has(v.sku.toUpperCase()));
                     
                     if (variantsToAdd.length > 0) {
-                        const updateData = {
-                            product: {
-                                id: existingProduct.id,
-                                tags: productData.tags,
-                                variants: [
-                                    ...fullProduct.variants,
-                                    ...variantsToAdd
-                                ]
-                            }
-                        };
-                        
-                        await shopifyRequestWithRetry('put', `/products/${existingProduct.id}.json`, updateData);
+                        await shopifyRequestWithRetry('put', `/products/${existingProduct.id}.json`, { product: { id: existingProduct.id, tags: productData.tags, variants: [...fullProduct.variants, ...variantsToAdd] } });
                         
                         const updatedProductRes = await shopifyRequestWithRetry('get', `/products/${existingProduct.id}.json`);
                         const updatedVariants = updatedProductRes.data.product.variants;
@@ -516,14 +412,8 @@ async function processProductImport() {
                             const createdVariant = updatedVariants.find(v => v.sku === variant.sku);
                             if (createdVariant && variant.inventory_quantity > 0) {
                                 try {
-                                    await shopifyRequestWithRetry('post', '/inventory_levels/set.json', {
-                                        location_id: config.shopify.locationId,
-                                        inventory_item_id: createdVariant.inventory_item_id,
-                                        available: variant.inventory_quantity
-                                    });
-                                } catch (e) {
-                                    // Ignore inventory errors
-                                }
+                                    await shopifyRequestWithRetry('post', '/inventory_levels/set.json', { location_id: config.shopify.locationId, inventory_item_id: createdVariant.inventory_item_id, available: variant.inventory_quantity });
+                                } catch (e) { /* Ignore */ }
                             }
                         }
                         
@@ -533,24 +423,10 @@ async function processProductImport() {
                     } else {
                         addLog(`ℹ️ No new variants for: ${existingProduct.title}`, 'info');
                     }
-                    
                 } else {
                     addLog(`Creating new product: ${productData.title} (${baseSKU})`, 'info');
                     
-                    const createData = {
-                        product: {
-                            title: productData.title,
-                            body_html: productData.body_html,
-                            vendor: productData.vendor,
-                            product_type: productData.product_type,
-                            handle: productData.handle,
-                            tags: productData.tags,
-                            images: productData.images,
-                            options: productData.options.length > 0 ? productData.options : undefined,
-                            variants: productData.variants
-                        }
-                    };
-                    
+                    const createData = { product: { ...productData, options: productData.options.length > 0 ? productData.options : undefined } };
                     const res = await shopifyRequestWithRetry('post', '/products.json', createData);
                     const createdProduct = res.data.product;
                     
@@ -558,14 +434,8 @@ async function processProductImport() {
                         const originalVariant = productData.variants.find(v => v.sku === variant.sku);
                         if (originalVariant?.inventory_quantity > 0) {
                             try {
-                                await shopifyRequestWithRetry('post', '/inventory_levels/set.json', {
-                                    location_id: config.shopify.locationId,
-                                    inventory_item_id: variant.inventory_item_id,
-                                    available: originalVariant.inventory_quantity
-                                });
-                            } catch (e) {
-                                // Ignore inventory errors
-                            }
+                                await shopifyRequestWithRetry('post', '/inventory_levels/set.json', { location_id: config.shopify.locationId, inventory_item_id: variant.inventory_item_id, available: originalVariant.inventory_quantity });
+                            } catch (e) { /* Ignore */ }
                         }
                     }
                     
@@ -578,13 +448,10 @@ async function processProductImport() {
                 if (processedCount % 50 === 0 || processedCount === productsByBaseSKU.size) {
                     addLog(`Import Progress: Processed ${processedCount}/${productsByBaseSKU.size} products...`, 'info');
                 }
-                
             } catch (e) {
                 runResult.errors++;
                 let errorDetails = e.message;
-                if (e.response?.data?.errors) {
-                    errorDetails = JSON.stringify(e.response.data.errors);
-                }
+                if (e.response?.data?.errors) errorDetails = JSON.stringify(e.response.data.errors);
                 addLog(`❌ Failed to process ${productData.title}: ${errorDetails}`, 'error');
             }
         }
@@ -601,16 +468,127 @@ async function processProductImport() {
 // SYNC WRAPPERS & API
 // ============================================
 
-async function syncInventory() { /* ... */ }
+const isSystemLocked = () => Object.values(isRunning).some(v => v) || isSystemPaused || failsafe.isTriggered || confirmation.isAwaiting;
 
-// ... other API endpoints ...
+async function syncInventory() { if (isSystemLocked()) return; /* ... */ }
+
+app.post('/api/upload/products', upload.single('file'), async (req, res) => {
+    try {
+        if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
+        const result = await extractUploadedFiles(req.file, UPLOADED_FILES_DIR);
+        res.json({ success: true, ...result, fileName: req.file.originalname, fileSize: req.file.size });
+    } catch (error) {
+        addLog(`Upload failed: ${error.message}`, 'error');
+        res.status(500).json({ error: error.message });
+    }
+});
+
+app.post('/api/upload/discontinued', upload.single('file'), async (req, res) => {
+    try {
+        if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
+        const result = await extractUploadedFiles(req.file, DISCONTINUED_FILES_DIR);
+        res.json({ success: true, ...result, fileName: req.file.originalname, fileSize: req.file.size });
+    } catch (error) {
+        addLog(`Upload failed: ${error.message}`, 'error');
+        res.status(500).json({ error: error.message });
+    }
+});
+
+app.get('/api/upload/status', (req, res) => {
+    const catalogFiles = getLatestCatalogFiles();
+    res.json({
+        hasProductFiles: !!catalogFiles?.productFiles?.length,
+        hasDiscontinuedFile: !!catalogFiles?.discontinuedFile,
+        productFileCount: catalogFiles?.productFiles?.length || 0,
+        discontinuedFile: catalogFiles?.discontinuedFile?.name,
+        productUploadTime: catalogFiles?.productFiles?.[0]?.uploadTime,
+        discontinuedUploadTime: catalogFiles?.discontinuedFile?.uploadTime,
+        totalProductSize: catalogFiles?.totalProductSize || 0,
+        totalDiscontinuedSize: catalogFiles?.totalDiscontinuedSize || 0
+    });
+});
+
+app.post('/api/sync/inventory', (req, res) => { syncInventory(); res.json({ success: true }); });
+app.post('/api/import/products', (req, res) => { processProductImport(); res.json({ success: true }); });
+app.post('/api/process/discontinued', (req, res) => { /* ... */ });
+app.post('/api/cleanup/once', (req, res) => { /* ... */ });
+app.post('/api/pause/toggle', (req, res) => { isSystemPaused = !isSystemPaused; if (isSystemPaused) fs.writeFileSync(PAUSE_LOCK_FILE, 'paused'); else try { fs.unlinkSync(PAUSE_LOCK_FILE); } catch(e){} addLog(`System ${isSystemPaused ? 'PAUSED' : 'RESUMED'}.`, 'warning'); res.json({ success: true }); });
+app.post('/api/failsafe/clear', (req, res) => { failsafe = { isTriggered: false }; addLog('Failsafe cleared.', 'warning'); res.json({ success: true }); });
+app.post('/api/confirmation/proceed', (req, res) => { if (confirmation.isAwaiting) { const action = confirmation.proceedAction; resetConfirmationState(); if (action) action(); } res.json({ success: true }); });
+app.post('/api/confirmation/abort', (req, res) => { if (confirmation.isAwaiting) { confirmation.abortAction(); } res.json({ success: true }); });
 
 // ============================================
 // WEB INTERFACE
 // ============================================
 
 app.get('/', (req, res) => {
-    // ... UI rendering logic ...
+    const catalogFiles = getLatestCatalogFiles();
+    const lastProductImport = runHistory.find(r => r.type === 'Product Import');
+    const lastDiscontinue = runHistory.find(r => r.type === 'Discontinue Products');
+    
+    const html = `<!DOCTYPE html><html lang="en"><head><title>Ralawise Sync</title><meta name="viewport" content="width=device-width, initial-scale=1"><style>body{font-family:-apple-system,BlinkMacSystemFont,sans-serif;background:#0d1117;color:#c9d1d9;margin:0;line-height:1.5;}.container{max-width:1400px;margin:auto;padding:1rem;}.card{background:#161b22;border:1px solid #30363d;padding:1.5rem;border-radius:6px;margin-bottom:1rem;}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:1rem;}.btn{padding:0.5rem 1rem;border:1px solid #30363d;border-radius:6px;cursor:pointer;background:#21262d;color:#c9d1d9;font-weight:600;}.btn-primary{background:#238636;color:white;border-color:#2ea043;}.btn-danger{background:#da3633;color:white;border-color:#f85149}.btn-warning{background:#d29922;color:white;border-color:#f0c674}.btn:disabled{opacity:0.5;cursor:not-allowed;}.logs{background:#010409;padding:1rem;height:300px;overflow-y:auto;border-radius:6px;font-family:monospace;white-space:pre-wrap;font-size:0.875em;}.alert{padding:1rem;border-radius:6px;margin-bottom:1rem;border:1px solid;}.alert-warning{background-color:rgba(210,149,34,0.1);border-color:#d29922;}.stat-card{text-align:center;}.stat-value{font-size:2rem;font-weight:600;}.stat-label{font-size:0.8rem;color:#8b949e;}.product-list{list-style:none;padding:0;font-size:0.9em;max-height:150px;overflow-y:auto;} .product-list a{color:#58a6ff;text-decoration:none;} .product-list a:hover{text-decoration:underline;} .progress-container{margin-top:0.5rem;} .progress-bar{height:8px;background:#30363d;border-radius:4px;overflow:hidden; width: 100%;} .progress-fill{height:100%;background:linear-gradient(90deg, #1f6feb, #2ea043);transition:width 0.5s;}.location-info{font-size:0.875em;color:#8b949e;margin-top:0.5rem;}.file-upload{margin-top:1rem;padding:1rem;border:2px dashed #30363d;border-radius:6px;text-align:center;}.file-upload input{display:none;}.file-upload label{cursor:pointer;padding:0.5rem 1rem;background:#21262d;border-radius:6px;display:inline-block;}.upload-status{margin-top:0.5rem;font-size:0.875em;color:#8b949e;}.section-header{font-size:1.1rem;font-weight:600;margin-bottom:0.5rem;color:#58a6ff;}</style></head><body><div class="container"><h1>Ralawise Sync</h1>
+    ${confirmation.isAwaiting ? `<div class="alert alert-warning"><h3>🤔 Confirmation Required</h3><p>${confirmation.message}</p><div><button onclick="apiPost('/api/confirmation/proceed')" class="btn btn-primary">Proceed</button> <button onclick="apiPost('/api/confirmation/abort')" class="btn">Abort & Pause</button></div></div>` : ''}
+    
+    <div class="grid">
+        <div class="card"><h2>System</h2><p>Status: ${isSystemPaused?'Paused':failsafe.isTriggered?'FAILSAFE': Object.values(isRunning).some(v => v) ? 'Busy' : 'Active'}</p><button onclick="apiPost('/api/pause/toggle')" class="btn" ${failsafe.isTriggered||confirmation.isAwaiting?'disabled':''}>${isSystemPaused?'Resume':'Pause'}</button>${failsafe.isTriggered?`<button onclick="apiPost('/api/failsafe/clear')" class="btn">Clear Failsafe</button>`:''}<div class="location-info">Location ID: ${config.shopify.locationId}</div></div>
+        <div class="card"><h2>Inventory Sync</h2><p>Status: ${isRunning.inventory?'Running':'Ready'}</p><button onclick="apiPost('/api/sync/inventory','Run inventory sync?')" class="btn btn-primary" ${isSystemLocked()?'disabled':''}>Run Now</button></div>
+    </div>
+    
+    <div class="card">
+        <h2>📦 Product Management</h2>
+        <div class="grid">
+            <div>
+                <div class="section-header">New/Update Products</div>
+                <div class="file-upload">
+                    <label for="product-file-input" class="btn">📁 Upload Product Catalog</label>
+                    <input type="file" id="product-file-input" accept=".csv,.zip" onchange="uploadFile(this, 'products')">
+                    <div class="upload-status">
+                        ${catalogFiles?.productFiles?.length ? `✅ ${catalogFiles.productFileCount} files (${(catalogFiles.totalProductSize / 1024 / 1024).toFixed(1)} MB)` : '❌ No product files'}
+                        ${catalogFiles?.productFiles?.length ? `<br>📅 ${new Date(catalogFiles.productFiles[0].uploadTime).toLocaleString()}` : ''}
+                    </div>
+                </div>
+                <button onclick="apiPost('/api/import/products','Import/update products?')" class="btn btn-primary" ${isSystemLocked() || !catalogFiles?.productFiles?.length ?'disabled':''} style="margin-top:0.5rem;width:100%;">Import Products</button>
+            </div>
+            
+            <div>
+                <div class="section-header">Discontinued Products</div>
+                <div class="file-upload">
+                    <label for="discontinued-file-input" class="btn">📁 Upload Discontinued List</label>
+                    <input type="file" id="discontinued-file-input" accept=".csv" onchange="uploadFile(this, 'discontinued')">
+                    <div class="upload-status">
+                        ${catalogFiles?.discontinuedFile ? `✅ ${catalogFiles.discontinuedFile.name}` : '❌ No discontinued file'}
+                        ${catalogFiles?.discontinuedFile ? `<br>📅 ${new Date(catalogFiles.discontinuedFile.uploadTime).toLocaleString()}` : ''}
+                    </div>
+                </div>
+                <button onclick="apiPost('/api/process/discontinued','Process discontinued products?')" class="btn btn-warning" ${isSystemLocked() || !catalogFiles?.discontinuedFile ?'disabled':''} style="margin-top:0.5rem;width:100%;">Process Discontinued</button>
+            </div>
+        </div>
+    </div>
+    
+    <div class="grid">
+        <div class="card">
+            <h2>Last Product Import</h2>
+            <div class="grid" style="grid-template-columns:1fr 1fr;">
+                <div class="stat-card"><div class="stat-value">${lastProductImport?.created ?? 'N/A'}</div><div class="stat-label">Created</div></div>
+                <div class="stat-card"><div class="stat-value">${lastProductImport?.updated ?? 'N/A'}</div><div class="stat-label">Updated</div></div>
+            </div>
+        </div>
+        
+        <div class="card">
+            <h2>Last Discontinued Process</h2>
+            <div class="grid" style="grid-template-columns:1fr 1fr;">
+                <div class="stat-card"><div class="stat-value">${lastDiscontinue?.discontinued ?? 'N/A'}</div><div class="stat-label">Discontinued</div></div>
+                <div class="stat-card"><div class="stat-value">${lastDiscontinue?.kept ?? 'N/A'}</div><div class="stat-label">Kept (Stock > ${config.ralawise.discontinuedStockThreshold})</div></div>
+            </div>
+        </div>
+    </div>
+    
+    <div class="card"><h2>Logs</h2><div class="logs">${logs.map(log=>`<div class="log-entry log-${log.type}">[${new Date(log.timestamp).toLocaleTimeString()}] ${log.message}</div>`).join('')}</div></div>
+    </div><script>
+    async function apiPost(url,confirmMsg){if(confirmMsg&&!confirm(confirmMsg))return;try{const btn=event.target;if(btn)btn.disabled=true;await fetch(url,{method:'POST'});setTimeout(()=>location.reload(),500)}catch(e){alert(e.message);if(btn)btn.disabled=false;}}
+    async function uploadFile(input,type){const file=input.files[0];if(!file)return;const formData=new FormData();formData.append('file',file);try{const label=input.previousElementSibling;label.textContent='Uploading...';const res=await fetch('/api/upload/'+type,{method:'POST',body:formData});const data=await res.json();if(data.success){alert('File uploaded successfully! '+(data.fileCount?data.fileCount+' files extracted.':''));location.reload();}else{alert('Upload failed: '+data.error);label.textContent='📁 Upload '+(type==='products'?'Product Catalog':'Discontinued List');}}catch(e){alert('Upload error: '+e.message);}}
+    </script></body></html>`;
+    res.send(html);
 });
 
 // ============================================
