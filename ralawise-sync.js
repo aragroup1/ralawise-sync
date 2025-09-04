@@ -89,7 +89,7 @@ function getWordOverlap(str1, str2) {
   return (intersection.size / Math.max(words1.size, words2.size)) * 100; 
 }
 
-// Centralized function to trigger a failsafe and wait for user action
+// NEW: Centralized function to trigger a failsafe and wait for user action
 async function triggerFailsafe(reason, continuationFn) {
   failsafeTriggered = true;
   failsafeReason = reason;
@@ -99,7 +99,7 @@ async function triggerFailsafe(reason, continuationFn) {
   return true;
 }
 
-// Function to sanitize and truncate HTML for Shopify (no external packages needed)
+// NEW: Function to sanitize and truncate HTML for Shopify
 function sanitizeHtmlForShopify(html) {
   if (!html) return '';
   
@@ -131,7 +131,7 @@ function sanitizeHtmlForShopify(html) {
   return html;
 }
 
-// Function to sanitize product handle
+// NEW: Function to sanitize product handle
 function sanitizeHandle(handle) {
   if (!handle) return '';
   // Shopify handles can only contain letters, numbers, and hyphens
@@ -142,7 +142,7 @@ function sanitizeHandle(handle) {
     .substring(0, 255); // Shopify handle limit
 }
 
-// Function to extract detailed error from Shopify response
+// NEW: Function to extract detailed error from Shopify response
 function extractShopifyError(error) {
   if (error.response && error.response.data) {
     const data = error.response.data;
@@ -237,7 +237,8 @@ function normalizeForMatching(text = '') {
   return String(text)
     .toLowerCase()
     .replace(/\s*KATEX_INLINE_OPEN.*?KATEX_INLINE_CLOSE\s*/g, ' ')
-    .replace(/\s*```math.*?```\s*/g, ' ')
+    .replace(/\s*```math
+.*?```\s*/g, ' ')
     .replace(/-(parcel|large-letter|letter)-rate$/i, '')
     .replace(/-p\d+$/i, '')
     .replace(/\b(a|an|the|of|in|on|at|to|for|with|by)\b/g, '')
@@ -588,54 +589,6 @@ async function improvedMapSkusJob(token) {
     addLog(`- Total to update: ${updateCandidates.length}`, 'info');
     addLog(`- No match found: ${noMatch}`, 'info');
     
-    if (noMatch > 0) {
-      addLog(`\n===== DIAGNOSTIC INFORMATION FOR UNMATCHED PRODUCTS =====`, 'warning');
-      
-      const numericSkuCount = toProcess.filter(p => {
-        const sku = p.variants?.[0]?.sku;
-        return sku && /^\d+$/.test(sku);
-      }).length;
-      
-      const shortTitleCount = toProcess.filter(p => 
-        normalizeForMatching(p.title).length < 10
-      ).length;
-      
-      const noHandleCount = toProcess.filter(p => 
-        !p.handle || p.handle.length < 3
-      ).length;
-      
-      addLog(`Numeric-only SKUs (likely partial SKUs): ${numericSkuCount} (${Math.round(numericSkuCount/noMatch*100)}% of unmatched)`, 'warning');
-      addLog(`Very short titles: ${shortTitleCount} (${Math.round(shortTitleCount/noMatch*100)}% of unmatched)`, 'warning');
-      addLog(`Missing/short handles: ${noHandleCount} (${Math.round(noHandleCount/noMatch*100)}% of unmatched)`, 'warning');
-      
-      if (unmatchedSamples.badFormat.length > 0) {
-        addLog(`\nProducts with numeric-only SKUs (examples):`, 'warning');
-        unmatchedSamples.badFormat.forEach((item, i) => {
-          addLog(`  ${i+1}. "${item.shopifyTitle}" - Current SKU: ${item.shopifySku} - Best potential match: "${item.bestMatchTitle}" (${item.bestOverlap}% overlap)`, 'warning');
-        });
-      }
-      
-      if (unmatchedSamples.closeMatches.length > 0) {
-        addLog(`\nProducts with close but not matching titles:`, 'warning');
-        unmatchedSamples.closeMatches.forEach((item, i) => {
-          addLog(`  ${i+1}. "${item.shopifyTitle}" - Current SKU: ${item.shopifySku}`, 'warning');
-          const topMatches = item.potentialMatches.sort((a, b) => b.overlap - a.overlap).slice(0, 3);
-          topMatches.forEach((match, j) => {
-            addLog(`     Close match ${j+1}: "${match.title}" (${match.overlap}% overlap) - SKU: ${match.sku}`, 'warning');
-          });
-        });
-      }
-      
-      if (unmatchedSamples.noCloseMatches.length > 0) {
-        addLog(`\nProducts with no close matches at all:`, 'warning');
-        unmatchedSamples.noCloseMatches.forEach((item, i) => {
-          addLog(`  ${i+1}. "${item.shopifyTitle}" - Current SKU: ${item.shopifySku}`, 'warning');
-        });
-      }
-      
-      addLog(`\n===== END DIAGNOSTIC INFORMATION =====`, 'warning');
-    }
-    
     if (updateCandidates.length > 0) {
       addLog(`Examples of SKUs to update:`, 'warning');
       for (let i = 0; i < Math.min(5, updateCandidates.length); i++) {
@@ -764,8 +717,6 @@ async function updateInventoryJob(token) {
         const item = notFoundItems[i];
         addLog(`  - SKU: ${item.sku}, Title: "${item.title}", Inventory: ${item.inventory}`, 'warning');
       }
-      addLog(`These ${notFound} products likely need to have their SKUs mapped or be created in your Shopify store.`, 'info');
-      addLog(`Try running the "Comprehensive SKU Mapping" job first, then "Sync New Products" for any remaining items.`, 'info');
     }
 
     const performUpdates = async (jobToken) => {
@@ -790,7 +741,6 @@ async function updateInventoryJob(token) {
       }
       
       if (statusUpdates.length > 0) {
-        addLog(`Updating status for ${statusUpdates.length} products...`, 'info');
         for (const update of statusUpdates) {
           if (shouldAbort(jobToken)) break;
           try {
@@ -876,15 +826,12 @@ async function createNewProductsJob(token) {
       const createdItems = [];
       const maxToCreate = Math.min(toCreate.length, MAX_CREATE_PER_RUN);
       
-      if (toCreate.length > maxToCreate) {
-        addLog(`Limiting creation to ${maxToCreate} products out of ${toCreate.length} found.`, 'warning');
-      }
-      
       for (let i = 0; i < maxToCreate; i++) {
         if (shouldAbort(jobToken)) break;
         const apifyProd = toCreate[i];
         
         try {
+          // Log what we're about to create for debugging
           addLog(`Creating product: "${apifyProd.title}" (SKU: ${apifyProd.sku}, Handle: ${apifyProd.handle})`, 'info');
           
           const newProduct = { 
@@ -894,7 +841,7 @@ async function createNewProductsJob(token) {
               vendor: 'Imported', 
               product_type: '', 
               tags: SUPPLIER_TAG, 
-              handle: apifyProd.handle,
+              handle: apifyProd.handle, // Ensure handle is included
               status: apifyProd.inventory > 0 ? 'active' : 'draft', 
               variants: [{ 
                 price: apifyProd.price, 
@@ -911,6 +858,7 @@ async function createNewProductsJob(token) {
           const { data } = await shopifyClient.post('/products.json', newProduct);
           const inventoryItemId = data.product.variants[0].inventory_item_id;
           
+          // Set inventory
           await shopifyClient.post('/inventory_levels/set.json', { 
             inventory_item_id: inventoryItemId, 
             location_id: config.shopify.locationId, 
@@ -924,19 +872,21 @@ async function createNewProductsJob(token) {
             sku: apifyProd.sku 
           });
           
-          addLog(`✓ Created product: "${apifyProd.title}" with SKU: ${apifyProd.sku} (Status: ${apifyProd.inventory > 0 ? 'active' : 'draft'})`, 'success');
+          addLog(`✓ Created product: "${apifyProd.title}" with SKU: ${apifyProd.sku}`, 'success');
           
         } catch (e) { 
           errors++; 
           const errorMsg = extractShopifyError(e);
           addLog(`✗ Error creating product "${apifyProd.title}": ${errorMsg}`, 'error', e);
           
+          // Store failed product info for debugging
           failedProducts.push({
             title: apifyProd.title,
             sku: apifyProd.sku,
             error: errorMsg
           });
           
+          // If we get specific errors, log more details
           if (errorMsg.includes('body_html') || errorMsg.includes('description')) {
             addLog(`  Description length: ${apifyProd.body_html.length} characters`, 'warning');
           }
@@ -958,11 +908,12 @@ async function createNewProductsJob(token) {
         errors, 
         skipped: toCreate.length - created - errors, 
         createdItems,
-        failedProducts: failedProducts.slice(0, 20)
+        failedProducts: failedProducts.slice(0, 20) // Store first 20 failed products for review
       };
       
-      addLog(`Product creation complete: ${created} created, ${errors} errors.`, created > 0 ? 'success' : 'info');
+      addLog(`Product creation complete: ${created} created, ${errors} errors.`, 'success');
       
+      // If there were errors, provide a summary
       if (failedProducts.length > 0) {
         addLog(`Failed products summary (showing first 5):`, 'warning');
         for (let i = 0; i < Math.min(5, failedProducts.length); i++) {
@@ -1039,12 +990,14 @@ async function handleDiscontinuedProductsJob(token) {
         try {
           const inventoryItemId = product.variants[0].inventory_item_id;
           
+          // Set inventory to 0
           await shopifyClient.post('/inventory_levels/set.json', { 
             inventory_item_id: inventoryItemId, 
             location_id: config.shopify.locationId, 
             available: 0 
           });
           
+          // Set status to draft
           await shopifyClient.put(`/products/${product.id}.json`, { 
             product: { 
               id: product.id, 
@@ -1079,7 +1032,7 @@ async function handleDiscontinuedProductsJob(token) {
         discontinuedItems 
       };
       
-      addLog(`Discontinued check complete: ${discontinued} products set to draft.`, discontinued > 0 ? 'success' : 'info');
+      addLog(`Discontinued check complete: ${discontinued} products set to draft.`, 'success');
     };
 
     if (potentialDiscontinued.length > 0) {
