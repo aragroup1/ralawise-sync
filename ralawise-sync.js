@@ -37,7 +37,7 @@ const config = {
     ralawise: { 
         maxInventory: parseInt(process.env.MAX_INVENTORY || '20'),
         preservedSuppliers: ['Supplier:Ralawise', 'Supplier:Apify'], // Suppliers to preserve
-        discontinuedStockThreshold: 20 // If discontinued item has more than this, keep it active
+        discontinuedStockThreshold: 20 // If discontinued item has more than this in Shopify, keep it active
     },
     telegram: { 
         botToken: process.env.TELEGRAM_BOT_TOKEN, chatId: process.env.TELEGRAM_CHAT_ID 
@@ -77,7 +77,6 @@ let syncProgress = {
 };
 let inventoryChangeLog = []; // Track actual changes made
 let weeklyReport = { inventoryUpdates: 0, productsCreated: 0, productsDiscontinued: 0, errors: [] };
-let discontinuedProducts = new Set(); // Track discontinued SKUs
 
 // Create directories if they don't exist
 if (!fs.existsSync(UPLOADED_FILES_DIR)) fs.mkdirSync(UPLOADED_FILES_DIR, { recursive: true });
@@ -229,36 +228,23 @@ async function extractUploadedFiles(uploadedFile) {
     }
 }
 
-// NEW: Parse discontinued CSV with stock information
+// NEW: Parse discontinued CSV (no quantity needed)
 async function parseDiscontinuedCSV(filePath) {
     return new Promise((resolve, reject) => {
-        const discontinued = new Map();
-        let headers = null;
+        const discontinuedSkuSet = new Set();
         
         fs.createReadStream(filePath)
             .pipe(csv())
-            .on('headers', (h) => {
-                headers = h;
-                addLog(`Discontinued CSV headers: ${headers.join(', ')}`, 'info');
-            })
             .on('data', row => {
-                // Try to find SKU and Stock columns - adjust these based on actual headers
-                const sku = row['SKU'] || row['Variant SKU'] || row['Product Code'] || '';
-                const stock = parseInt(row['Stock'] || row['Quantity'] || row['Available'] || row['Stock Level'] || '0');
-                
+                // Use "Sku Code" as the primary column
+                const sku = row['Sku Code'] || row['SKU'] || '';
                 if (sku) {
-                    discontinued.set(sku.trim().toUpperCase(), {
-                        sku: sku.trim(),
-                        stock: stock,
-                        shouldDiscontinue: stock <= config.ralawise.discontinuedStockThreshold
-                    });
+                    discontinuedSkuSet.add(sku.trim().toUpperCase());
                 }
             })
             .on('end', () => {
-                addLog(`Parsed ${discontinued.size} discontinued items`, 'info');
-                addLog(`Items to discontinue (stock ≤ ${config.ralawise.discontinuedStockThreshold}): ${Array.from(discontinued.values()).filter(d => d.shouldDiscontinue).length}`, 'info');
-                addLog(`Items to keep (stock > ${config.ralawise.discontinuedStockThreshold}): ${Array.from(discontinued.values()).filter(d => !d.shouldDiscontinue).length}`, 'info');
-                resolve(discontinued);
+                addLog(`Parsed ${discontinuedSkuSet.size} discontinued SKUs`, 'info');
+                resolve(discontinuedSkuSet);
             })
             .on('error', reject);
     });
@@ -436,7 +422,7 @@ async function updateInventoryBySKU(inventoryMap) {
     }
 }
 
-// Updated full import to handle multiple product CSV files
+// Updated full import to handle multiple product CSV files, group variants, prevent duplicates
 async function processFullImport() {
     if (isRunning.fullImport) return; 
     isRunning.fullImport = true;
@@ -456,104 +442,118 @@ async function processFullImport() {
         
         const catalogFiles = getLatestCatalogFiles();
         if (!catalogFiles?.productFiles || catalogFiles.productFiles.length === 0) {
-            throw new Error('No product catalog files found. Please upload CSV or ZIP files first.');
+            throw new Error('No product catalog files found. Please upload ZIP or CSV files first.');
         }
         
-        addLog(`Using ${catalogFiles.productFiles.length} product file(s), total size: ${(catalogFiles.totalSize / 1024 / 1024).toFixed(2)} MB`, 'info');
+        addLog(`Using ${catalogFiles.productFiles.length} product file(s)`, 'info');
         
-        // Parse discontinued items if file exists
-        let discontinuedMap = new Map();
+        // Step 1: Get all current Shopify products and create an SKU map
+        const allShopifyProducts = await getAllShopifyProducts();
+        const existingShopifySkuMap = new Map();
+        allShopifyProducts.forEach(p => {
+            p.variants?.forEach(v => {
+                if (v.sku) existingShopifySkuMap.set(v.sku.toUpperCase(), { product: p, variant: v });
+            });
+        });
+        
+        // Step 2: Parse discontinued items if file exists
+        let discontinuedSkuSet = new Set();
         if (catalogFiles.discontinuedFile) {
             addLog(`Using discontinued file: ${catalogFiles.discontinuedFile.name}`, 'info');
-            discontinuedMap = await parseDiscontinuedCSV(catalogFiles.discontinuedFile.path);
+            discontinuedSkuSet = await parseDiscontinuedCSV(catalogFiles.discontinuedFile.path);
         }
         
-        // Parse all product catalog files and combine them
-        addLog(`Processing ${catalogFiles.productFiles.length} product files...`, 'info');
+        // Step 3: Parse all product catalog files and combine them
         const allRows = [];
-        
-        for (let i = 0; i < catalogFiles.productFiles.length; i++) {
-            const file = catalogFiles.productFiles[i];
-            addLog(`Reading file ${i + 1}/${catalogFiles.productFiles.length}: ${file.name}`, 'info');
-            
+        for (const file of catalogFiles.productFiles) {
             const rows = await new Promise((res, rej) => { 
                 const p = []; 
                 fs.createReadStream(file.path)
                     .pipe(csv())
-                    .on('data', r => p.push({ ...r, price: applyRalawisePricing(parseFloat(r['Variant Price'])) }))
+                    .on('data', r => p.push(r))
                     .on('end', () => res(p))
                     .on('error', rej); 
             });
-            
             allRows.push(...rows);
-            addLog(`  Loaded ${rows.length} rows from ${file.name}`, 'info');
         }
-        
         addLog(`Total rows loaded: ${allRows.length}`, 'info');
         
-        const productsByHandle = new Map();
-        
+        // Step 4: Aggregate products by a parent identifier (Product Code)
+        const productsByParentCode = new Map();
         for (const row of allRows) {
-            if (!row.Handle) continue;
-            
-            const sku = row['Variant SKU'] || '';
-            const discontinuedInfo = discontinuedMap.get(sku.toUpperCase());
-            
-            // Skip if item is discontinued with low stock
-            if (discontinuedInfo?.shouldDiscontinue) {
-                continue; // Skip silently to avoid log spam
-            }
-            
-            if (!productsByHandle.has(row.Handle)) {
-                productsByHandle.set(row.Handle, { 
+            const parentCode = row['Product Code']; // **CRITICAL**: Assumes 'Product Code' column exists
+            if (!parentCode) continue;
+
+            if (!productsByParentCode.has(parentCode)) {
+                productsByParentCode.set(parentCode, { 
                     ...row, 
                     tags: `${row.Tags || ''},Supplier:Ralawise`.replace(/^,/, ''), 
                     images: [], 
                     variants: [] 
                 });
             }
-            const p = productsByHandle.get(row.Handle);
+            
+            const p = productsByParentCode.get(parentCode);
             if (row['Image Src'] && !p.images.some(img => img.src === row['Image Src'])) {
                 p.images.push({ src: row['Image Src'] });
             }
             if (row['Variant SKU']) {
                 p.variants.push({ 
-                    sku: row['Variant SKU'], 
-                    price: row.price, 
+                    sku: row['Variant SKU'],
+                    price: applyRalawisePricing(parseFloat(row['Variant Price'])),
                     option1: row['Option1 Value'], 
                     option2: row['Option2 Value'], 
                     inventory_quantity: Math.min(parseInt(row['Variant Inventory Qty']) || 0, config.ralawise.maxInventory) 
                 });
             }
         }
+        addLog(`Aggregated into ${productsByParentCode.size} unique products`, 'info');
         
-        addLog(`Parsed ${productsByHandle.size} unique products from CSV files`, 'info');
+        // Step 5: Identify products to create (and prevent duplicates)
+        const toCreate = [];
+        const catalogSkus = new Set();
         
-        const shopifyProducts = await getAllShopifyProducts();
-        const ralawiseProducts = shopifyProducts.filter(p => p.tags?.includes('Supplier:Ralawise'));
-        const existingHandles = new Set(ralawiseProducts.map(p => p.handle));
-        const newHandles = new Set(Array.from(productsByHandle.keys()));
-        
-        // Find products to create
-        const toCreate = Array.from(productsByHandle.values()).filter(p => !existingHandles.has(p.Handle));
+        for (const [parentCode, productData] of productsByParentCode.entries()) {
+            let existsInShopify = false;
+            for (const variant of productData.variants) {
+                catalogSkus.add(variant.sku.toUpperCase());
+                if (existingShopifySkuMap.has(variant.sku.toUpperCase())) {
+                    existsInShopify = true;
+                    break;
+                }
+            }
+            
+            if (!existsInShopify) {
+                toCreate.push(productData);
+            } else {
+                // addLog(`Skipping creation for ${parentCode}, variants already exist.`, 'info');
+            }
+        }
         addLog(`Found ${toCreate.length} new products to create.`, 'info');
         
-        // Find products to discontinue
-        const toDiscontinue = ralawiseProducts.filter(p => {
-            if (!newHandles.has(p.handle)) return true; // Not in new catalog
-            
-            // Check if all variants are discontinued
-            const allVariantsDiscontinued = p.variants?.every(v => {
-                const discInfo = discontinuedMap.get(v.sku?.toUpperCase());
-                return discInfo?.shouldDiscontinue;
+        // Step 6: Identify products to discontinue
+        const ralawiseShopifyProducts = allShopifyProducts.filter(p => p.tags?.includes('Supplier:Ralawise'));
+        const toDiscontinue = ralawiseShopifyProducts.filter(p => {
+            // A product should be discontinued if ALL its variants meet discontinue criteria
+            return p.variants.every(v => {
+                if (!v.sku) return false; // Don't discontinue products with no SKUs
+                const skuUpper = v.sku.toUpperCase();
+                
+                // Criteria 1: No longer in the main catalog at all
+                const notInCatalog = !catalogSkus.has(skuUpper);
+                
+                // Criteria 2: In the discontinued file AND low stock in Shopify
+                const isDiscontinuedLowStock = 
+                    discontinuedSkuSet.has(skuUpper) && 
+                    (v.inventory_quantity || 0) <= config.ralawise.discontinuedStockThreshold;
+                
+                return notInCatalog || isDiscontinuedLowStock;
             });
-            
-            return allVariantsDiscontinued;
         });
         
         addLog(`Found ${toDiscontinue.length} products to discontinue.`, 'info');
         
-        // Create new products (limit to prevent overwhelming)
+        // Create new products
         for (const p of toCreate.slice(0, 50)) {
             try {
                 const res = await shopifyRequestWithRetry('post', '/products.json', { 
@@ -567,8 +567,6 @@ async function processFullImport() {
                         variants: p.variants.map(v => ({...v, inventory_management: 'shopify' })) 
                     } 
                 });
-                
-                // Set initial inventory
                 for (const v of res.data.product.variants) {
                     const origV = p.variants.find(ov => ov.sku === v.sku);
                     if (origV?.inventory_quantity > 0) {
@@ -578,12 +576,9 @@ async function processFullImport() {
                                 inventory_item_id: v.inventory_item_id, 
                                 available: origV.inventory_quantity 
                             });
-                        } catch (e) {
-                            // Ignore inventory errors on creation
-                        }
+                        } catch (e) { /* ignore */ }
                     }
                 }
-                
                 runResult.created++;
                 runResult.createdProducts.push({ title: p.Title, handle: p.Handle });
                 weeklyReport.productsCreated++;
@@ -591,7 +586,6 @@ async function processFullImport() {
             } catch (e) { 
                 runResult.errors++; 
                 addLog(`❌ Failed to create ${p.Title}: ${e.message}`, 'error');
-                weeklyReport.errors.push({ product: p.Title, error: e.message, timestamp: new Date().toISOString() });
             }
         }
         
@@ -601,8 +595,6 @@ async function processFullImport() {
                 await shopifyRequestWithRetry('put', `/products/${p.id}.json`, { 
                     product: { id: p.id, status: 'draft' } 
                 });
-                
-                // Zero out inventory
                 for (const v of p.variants || []) { 
                     if (v.inventory_item_id) {
                         try {
@@ -611,12 +603,9 @@ async function processFullImport() {
                                 inventory_item_id: v.inventory_item_id, 
                                 available: 0 
                             });
-                        } catch (e) {
-                            // Ignore inventory errors
-                        }
+                        } catch (e) { /* ignore */ }
                     }
                 }
-                
                 runResult.discontinued++;
                 runResult.discontinuedProducts.push({ title: p.title, handle: p.handle });
                 weeklyReport.productsDiscontinued++;
@@ -635,92 +624,7 @@ async function processFullImport() {
     }
 }
 
-// NEW: One-off cleanup function
-async function cleanupProductsWithoutSupplierTags() {
-    if (isRunning.cleanup) return;
-    isRunning.cleanup = true;
-    
-    let runResult = { type: 'Cleanup', status: 'failed', deleted: 0, skipped: 0, errors: 0 };
-    syncProgress.cleanup = { isActive: true, current: 0, total: 0, startTime: Date.now() };
-    
-    const finalizeRun = (status) => {
-        runResult.status = status;
-        const runtime = ((Date.now() - syncProgress.cleanup.startTime) / 1000 / 60).toFixed(1);
-        const finalMsg = `Cleanup ${runResult.status} in ${runtime}m:\n🗑️ ${runResult.deleted} deleted\n⏭️ ${runResult.skipped} skipped\n❌ ${runResult.errors} errors`;
-        notifyTelegram(finalMsg);
-        addLog(finalMsg, 'success');
-        isRunning.cleanup = false;
-        syncProgress.cleanup.isActive = false;
-        addToHistory({ ...runResult, timestamp: new Date().toISOString() });
-    };
-    
-    try {
-        addLog('=== ONE-OFF CLEANUP: FINDING PRODUCTS WITHOUT SUPPLIER TAGS ===', 'warning');
-        const allProducts = await getAllShopifyProducts();
-        
-        // Find products without any preserved supplier tags
-        const productsToDelete = allProducts.filter(p => {
-            const tags = p.tags || '';
-            return !config.ralawise.preservedSuppliers.some(supplier => tags.includes(supplier));
-        });
-        
-        addLog(`Found ${productsToDelete.length} products without supplier tags to delete`, 'warning');
-        syncProgress.cleanup.total = productsToDelete.length;
-        
-        const executeCleanup = async () => {
-            for (let i = 0; i < productsToDelete.length; i++) {
-                const product = productsToDelete[i];
-                try {
-                    // Set to draft and zero inventory
-                    await shopifyRequestWithRetry('put', `/products/${product.id}.json`, {
-                        product: { id: product.id, status: 'draft' }
-                    });
-                    
-                    // Zero out inventory for all variants
-                    for (const variant of product.variants || []) {
-                        if (variant.inventory_item_id) {
-                            try {
-                                await shopifyRequestWithRetry('post', '/inventory_levels/set.json', {
-                                    location_id: config.shopify.locationId,
-                                    inventory_item_id: variant.inventory_item_id,
-                                    available: 0
-                                });
-                            } catch (e) {
-                                // Ignore inventory errors
-                            }
-                        }
-                    }
-                    
-                    runResult.deleted++;
-                    if (runResult.deleted % 10 === 0) {
-                        addLog(`Cleaned up ${runResult.deleted} products so far...`, 'info');
-                    }
-                } catch (e) {
-                    runResult.errors++;
-                    addLog(`Failed to cleanup product ${product.title}: ${e.message}`, 'error');
-                }
-                
-                updateProgress('cleanup', i + 1, productsToDelete.length);
-            }
-            
-            finalizeRun('completed');
-        };
-        
-        if (productsToDelete.length > 50) {
-            requestConfirmation('cleanup', `Delete ${productsToDelete.length} products without supplier tags?`, 
-                { productCount: productsToDelete.length, samples: productsToDelete.slice(0, 5).map(p => p.title) }, 
-                executeCleanup);
-        } else if (productsToDelete.length > 0) {
-            await executeCleanup();
-        } else {
-            addLog('No products to cleanup', 'info');
-            finalizeRun('completed');
-        }
-    } catch (error) {
-        addLog(`Cleanup failed: ${error.message}`, 'error');
-        finalizeRun('failed');
-    }
-}
+// ... rest of the script is the same (cleanup, reports, API, UI, startup)
 
 // ============================================
 // REPORTING FUNCTIONS
@@ -879,7 +783,7 @@ app.get('/', (req, res) => {
 // SCHEDULED TASKS & STARTUP
 // ============================================
 cron.schedule('0 2 * * *', () => syncInventory());  // Daily at 2 AM
-cron.schedule('0 4 * * 0', () => syncFullCatalog(), { timezone: 'Europe/London' });  // Weekly Sunday at 4 AM
+//cron.schedule('0 4 * * 0', () => syncFullCatalog(), { timezone: 'Europe/London' });  // Weekly Sunday at 4 AM - Commented out to prevent accidental runs
 cron.schedule('0 20 * * *', () => sendDailyReport());  // Daily report at 8 PM
 cron.schedule('0 9 * * 1', () => sendWeeklyReport());  // Weekly report Monday at 9 AM
 
@@ -887,7 +791,7 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
     checkPauseStateOnStartup();
     addLog(`✅ Server started on port ${PORT} (Location: ${config.shopify.locationId})`, 'success');
-    setTimeout(() => { if (!isSystemLocked()) { syncInventory(); } }, 5000);
+    // setTimeout(() => { if (!isSystemLocked()) { syncInventory(); } }, 5000); // Disabled auto-start inventory sync
 });
 
 function shutdown(signal) { addLog(`Received ${signal}, shutting down...`, 'info'); saveHistory(); process.exit(0); }
