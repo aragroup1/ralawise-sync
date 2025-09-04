@@ -403,7 +403,22 @@ async function processProductImport() {
                     const variantsToAdd = productData.variants.filter(v => !existingVariantsBySKU.has(v.sku.toUpperCase()));
                     
                     if (variantsToAdd.length > 0) {
-                        await shopifyRequestWithRetry('put', `/products/${existingProduct.id}.json`, { product: { id: existingProduct.id, tags: productData.tags, variants: [...fullProduct.variants, ...variantsToAdd] } });
+                        // ================== FIX START ==================
+                        const updatePayload = {
+                            product: {
+                                id: existingProduct.id,
+                                tags: productData.tags,
+                                variants: [...fullProduct.variants, ...variantsToAdd]
+                            }
+                        };
+                        // If the product data from CSV has defined options, include them in the update.
+                        // This is crucial to prevent the "Options cannot be blank" error when adding variants that use options.
+                        if (productData.options && productData.options.length > 0) {
+                            updatePayload.product.options = productData.options;
+                        }
+
+                        await shopifyRequestWithRetry('put', `/products/${existingProduct.id}.json`, updatePayload);
+                        // =================== FIX END ===================
                         
                         const updatedProductRes = await shopifyRequestWithRetry('get', `/products/${existingProduct.id}.json`);
                         const updatedVariants = updatedProductRes.data.product.variants;
