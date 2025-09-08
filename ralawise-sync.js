@@ -50,7 +50,8 @@ const config = {
     },
     rateLimit: {
         requestsPerSecond: 2,
-        burstSize: 40
+        burstSize: 40,
+        variantCreationDelay: 2000 // 2 second delay between creating new products to avoid variant limit
     }
 };
 
@@ -109,10 +110,35 @@ function getBaseSKU(variantSKU) {
     return variantSKU.substring(0, config.ralawise.baseSKULength).toUpperCase();
 }
 
+// Clean product title - remove color prefixes and dashes
+function cleanProductTitle(title, option1Value) {
+    if (!title) return '';
+    
+    // Remove the option1 value (usually color) from the beginning of the title
+    if (option1Value) {
+        const prefixPattern = new RegExp(`^${option1Value.replace(/[.*+?^${}()|[```\```/g, '\\$&')}\\s*[-–—]\\s*`, 'i');
+        title = title.replace(prefixPattern, '');
+    }
+    
+    // Remove any remaining leading dashes or special characters
+    title = title.replace(/^[\s\-–—]+/, '');
+    
+    // Replace multiple spaces with single space
+    title = title.replace(/\s+/g, ' ');
+    
+    // Remove dashes (as requested by user)
+    title = title.replace(/[-–—]/g, ' ');
+    
+    // Clean up multiple spaces again
+    title = title.replace(/\s+/g, ' ').trim();
+    
+    return title;
+}
+
 // Generate handle from base SKU and title
 function generateHandle(baseSKU, title) {
     const cleanTitle = title ? title.toLowerCase().replace(/[^a-z0-9]/g, '-').replace(/-+/g, '-') : '';
-    return `${baseSKU.toLowerCase()}-${cleanTitle}`.substring(0, 100);
+    return `${baseSKU.toLowerCase()}-${cleanTitle}`.substring(0, 100).replace(/-+$/, '');
 }
 
 function requestConfirmation(jobKey, message, details, proceedAction) { 
@@ -276,6 +302,8 @@ async function processProductImport() {
     isRunning.fullImport = true;
     
     let runResult = { type: 'Product Import', status: 'failed', created: 0, updated: 0, errors: 0, createdProducts: [], updatedProducts: [] };
+    let productCreationCount = 0; // Track how many products we've created in this run
+    
     const finalizeRun = (status) => {
         runResult.status = status;
         let createdProductsMessage = runResult.createdProducts.length > 0 ? `\n\n<b>New Products:</b>\n${runResult.createdProducts.slice(0,10).map(p => `- ${p.title}`).join('\n')}` : '';
@@ -328,14 +356,20 @@ async function processProductImport() {
             const baseSKU = getBaseSKU(variantSKU);
             
             if (!productsByBaseSKU.has(baseSKU)) {
-                let cleanTitle = row.Title;
-                if (row['Option1 Value']) cleanTitle = cleanTitle.replace(new RegExp(`^${row['Option1 Value']} - `), '');
-                
+                // Clean the title properly
+                const cleanTitle = cleanProductTitle(row.Title, row['Option1 Value']);
                 const handle = generateHandle(baseSKU, cleanTitle);
+                
                 productsByBaseSKU.set(baseSKU, {
-                    title: cleanTitle, handle, body_html: row['Body (HTML)'], vendor: row.Vendor,
-                    product_type: row['Type'], tags: `${row.Tags || ''},Supplier:Ralawise`.replace(/^,/, ''),
-                    images: [], variants: [], options: []
+                    title: cleanTitle, 
+                    handle, 
+                    body_html: row['Body (HTML)'], 
+                    vendor: row.Vendor,
+                    product_type: row['Type'], 
+                    tags: `${row.Tags || ''},Supplier:Ralawise`.replace(/^,/, ''),
+                    images: [], 
+                    variants: [], 
+                    options: []
                 });
             }
             
@@ -346,24 +380,36 @@ async function processProductImport() {
             }
             
             product.variants.push({
-                sku: variantSKU, price: applyRalawisePricing(parseFloat(row['Variant Price'])),
+                sku: variantSKU, 
+                price: applyRalawisePricing(parseFloat(row['Variant Price'])),
                 compare_at_price: row['Variant Compare At Price'] || null,
-                option1: row['Option1 Value'] || null, option2: row['Option2 Value'] || null, option3: row['Option3 Value'] || null,
+                option1: row['Option1 Value'] || null, 
+                option2: row['Option2 Value'] || null, 
+                option3: row['Option3 Value'] || null,
                 inventory_quantity: Math.min(parseInt(row['Variant Inventory Qty']) || 0, config.ralawise.maxInventory),
-                weight: parseFloat(row['Variant Grams']) || 0, weight_unit: 'g', inventory_management: 'shopify',
-                fulfillment_service: 'manual', barcode: row['Variant Barcode'] || null
+                weight: parseFloat(row['Variant Grams']) || 0, 
+                weight_unit: 'g', 
+                inventory_management: 'shopify',
+                fulfillment_service: 'manual', 
+                barcode: row['Variant Barcode'] || null
             });
             
-            if (row['Option1 Name'] && !product.options.some(o => o.name === row['Option1 Name'])) product.options.push({ name: row['Option1 Name'], position: 1, values: [] });
-            if (row['Option2 Name'] && !product.options.some(o => o.name === row['Option2 Name'])) product.options.push({ name: row['Option2 Name'], position: 2, values: [] });
-            if (row['Option3 Name'] && !product.options.some(o => o.name === row['Option3 Name'])) product.options.push({ name: row['Option3 Name'], position: 3, values: [] });
+            if (row['Option1 Name'] && !product.options.some(o => o.name === row['Option1 Name'])) 
+                product.options.push({ name: row['Option1 Name'], position: 1, values: [] });
+            if (row['Option2 Name'] && !product.options.some(o => o.name === row['Option2 Name'])) 
+                product.options.push({ name: row['Option2 Name'], position: 2, values: [] });
+            if (row['Option3 Name'] && !product.options.some(o => o.name === row['Option3 Name'])) 
+                product.options.push({ name: row['Option3 Name'], position: 3, values: [] });
         }
         
         productsByBaseSKU.forEach(product => {
             product.variants.forEach(variant => {
-                if (variant.option1 && product.options[0] && !product.options[0].values.includes(variant.option1)) product.options[0].values.push(variant.option1);
-                if (variant.option2 && product.options[1] && !product.options[1].values.includes(variant.option2)) product.options[1].values.push(variant.option2);
-                if (variant.option3 && product.options[2] && !product.options[2].values.includes(variant.option3)) product.options[2].values.push(variant.option3);
+                if (variant.option1 && product.options[0] && !product.options[0].values.includes(variant.option1)) 
+                    product.options[0].values.push(variant.option1);
+                if (variant.option2 && product.options[1] && !product.options[1].values.includes(variant.option2)) 
+                    product.options[1].values.push(variant.option2);
+                if (variant.option3 && product.options[2] && !product.options[2].values.includes(variant.option3)) 
+                    product.options[2].values.push(variant.option3);
             });
         });
         
@@ -378,7 +424,8 @@ async function processProductImport() {
             p.variants?.forEach(v => {
                 if (v.sku) {
                     const baseSKU = getBaseSKU(v.sku);
-                    if (baseSKU && !existingProductsByBaseSKU.has(baseSKU)) existingProductsByBaseSKU.set(baseSKU, p);
+                    if (baseSKU && !existingProductsByBaseSKU.has(baseSKU)) 
+                        existingProductsByBaseSKU.set(baseSKU, p);
                 }
             });
             if (p.handle) existingProductsByHandle.set(p.handle, p);
@@ -403,22 +450,57 @@ async function processProductImport() {
                     const variantsToAdd = productData.variants.filter(v => !existingVariantsBySKU.has(v.sku.toUpperCase()));
                     
                     if (variantsToAdd.length > 0) {
-                        // ================== FIX START ==================
-                        const updatePayload = {
-                            product: {
-                                id: existingProduct.id,
-                                tags: productData.tags,
-                                variants: [...fullProduct.variants, ...variantsToAdd]
+                        // Build complete options structure from both existing and new variants
+                        const allOptions = fullProduct.options || [];
+                        const optionValues = {};
+                        
+                        // Collect existing option values
+                        fullProduct.variants.forEach(v => {
+                            if (v.option1 && allOptions[0]) {
+                                if (!optionValues[allOptions[0].name]) optionValues[allOptions[0].name] = new Set();
+                                optionValues[allOptions[0].name].add(v.option1);
                             }
-                        };
-                        // If the product data from CSV has defined options, include them in the update.
-                        // This is crucial to prevent the "Options cannot be blank" error when adding variants that use options.
-                        if (productData.options && productData.options.length > 0) {
-                            updatePayload.product.options = productData.options;
-                        }
-
-                        await shopifyRequestWithRetry('put', `/products/${existingProduct.id}.json`, updatePayload);
-                        // =================== FIX END ===================
+                            if (v.option2 && allOptions[1]) {
+                                if (!optionValues[allOptions[1].name]) optionValues[allOptions[1].name] = new Set();
+                                optionValues[allOptions[1].name].add(v.option2);
+                            }
+                            if (v.option3 && allOptions[2]) {
+                                if (!optionValues[allOptions[2].name]) optionValues[allOptions[2].name] = new Set();
+                                optionValues[allOptions[2].name].add(v.option3);
+                            }
+                        });
+                        
+                        // Add new option values from variants to add
+                        variantsToAdd.forEach(v => {
+                            if (v.option1 && allOptions[0]) {
+                                if (!optionValues[allOptions[0].name]) optionValues[allOptions[0].name] = new Set();
+                                optionValues[allOptions[0].name].add(v.option1);
+                            }
+                            if (v.option2 && allOptions[1]) {
+                                if (!optionValues[allOptions[1].name]) optionValues[allOptions[1].name] = new Set();
+                                optionValues[allOptions[1].name].add(v.option2);
+                            }
+                            if (v.option3 && allOptions[2]) {
+                                if (!optionValues[allOptions[2].name]) optionValues[allOptions[2].name] = new Set();
+                                optionValues[allOptions[2].name].add(v.option3);
+                            }
+                        });
+                        
+                        // Build the options array with all values
+                        const updatedOptions = allOptions.map(opt => ({
+                            ...opt,
+                            values: optionValues[opt.name] ? Array.from(optionValues[opt.name]) : opt.values
+                        }));
+                        
+                        // Update product with new variants and complete options
+                        await shopifyRequestWithRetry('put', `/products/${existingProduct.id}.json`, { 
+                            product: { 
+                                id: existingProduct.id, 
+                                tags: productData.tags, 
+                                options: updatedOptions.length > 0 ? updatedOptions : undefined,
+                                variants: [...fullProduct.variants, ...variantsToAdd] 
+                            } 
+                        });
                         
                         const updatedProductRes = await shopifyRequestWithRetry('get', `/products/${existingProduct.id}.json`);
                         const updatedVariants = updatedProductRes.data.product.variants;
@@ -427,7 +509,11 @@ async function processProductImport() {
                             const createdVariant = updatedVariants.find(v => v.sku === variant.sku);
                             if (createdVariant && variant.inventory_quantity > 0) {
                                 try {
-                                    await shopifyRequestWithRetry('post', '/inventory_levels/set.json', { location_id: config.shopify.locationId, inventory_item_id: createdVariant.inventory_item_id, available: variant.inventory_quantity });
+                                    await shopifyRequestWithRetry('post', '/inventory_levels/set.json', { 
+                                        location_id: config.shopify.locationId, 
+                                        inventory_item_id: createdVariant.inventory_item_id, 
+                                        available: variant.inventory_quantity 
+                                    });
                                 } catch (e) { /* Ignore */ }
                             }
                         }
@@ -441,15 +527,31 @@ async function processProductImport() {
                 } else {
                     addLog(`Creating new product: ${productData.title} (${baseSKU})`, 'info');
                     
-                    const createData = { product: { ...productData, options: productData.options.length > 0 ? productData.options : undefined } };
+                    // Add delay between product creations to avoid variant limit
+                    if (productCreationCount > 0) {
+                        await delay(config.rateLimit.variantCreationDelay);
+                    }
+                    
+                    const createData = { 
+                        product: { 
+                            ...productData, 
+                            options: productData.options.length > 0 ? productData.options : undefined 
+                        } 
+                    };
+                    
                     const res = await shopifyRequestWithRetry('post', '/products.json', createData);
                     const createdProduct = res.data.product;
+                    productCreationCount++;
                     
                     for (const variant of createdProduct.variants) {
                         const originalVariant = productData.variants.find(v => v.sku === variant.sku);
                         if (originalVariant?.inventory_quantity > 0) {
                             try {
-                                await shopifyRequestWithRetry('post', '/inventory_levels/set.json', { location_id: config.shopify.locationId, inventory_item_id: variant.inventory_item_id, available: originalVariant.inventory_quantity });
+                                await shopifyRequestWithRetry('post', '/inventory_levels/set.json', { 
+                                    location_id: config.shopify.locationId, 
+                                    inventory_item_id: variant.inventory_item_id, 
+                                    available: originalVariant.inventory_quantity 
+                                });
                             } catch (e) { /* Ignore */ }
                         }
                     }
@@ -467,7 +569,17 @@ async function processProductImport() {
                 runResult.errors++;
                 let errorDetails = e.message;
                 if (e.response?.data?.errors) errorDetails = JSON.stringify(e.response.data.errors);
-                addLog(`❌ Failed to process ${productData.title}: ${errorDetails}`, 'error');
+                if (e.response?.data?.product) errorDetails = JSON.stringify(e.response.data.product);
+                if (e.response?.data?.base) errorDetails = JSON.stringify(e.response.data.base);
+                
+                // Check for variant limit error
+                if (errorDetails.includes('Daily variant creation limit')) {
+                    addLog(`⚠️ Hit daily variant limit. Consider running import again tomorrow.`, 'warning');
+                    addLog(`❌ Failed to process ${productData.title}: ${errorDetails}`, 'error');
+                    // Don't break the loop, just skip and continue with updates
+                } else {
+                    addLog(`❌ Failed to process ${productData.title}: ${errorDetails}`, 'error');
+                }
             }
         }
         
