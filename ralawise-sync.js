@@ -317,7 +317,7 @@ async function processProductImport() {
         
         const productsByBaseSKU = new Map();
         let skippedRows = 0;
-        let duplicateVariantRows = 0;
+        let duplicateOptionRows = 0;
         
         for (const row of allRows) {
             const variantSKU = row['Variant SKU'] || '';
@@ -329,31 +329,37 @@ async function processProductImport() {
             const baseSKU = getBaseSKU(variantSKU);
             
             if (!productsByBaseSKU.has(baseSKU)) {
-                // ================== FIX START: Robust Title Cleaning ==================
-                // The previous regex logic had a syntax error. This method is safer.
                 let cleanTitle = row.Title;
-                // If title contains " - ", remove the prefix part (e.g., "Black - ")
                 if (cleanTitle && cleanTitle.includes(' - ')) {
                     cleanTitle = cleanTitle.split(' - ').slice(1).join(' - ');
                 }
-                // =================== FIX END: Robust Title Cleaning ===================
 
                 const handle = generateHandle(baseSKU, cleanTitle);
                 productsByBaseSKU.set(baseSKU, {
                     title: cleanTitle, handle, body_html: row['Body (HTML)'], vendor: row.Vendor,
                     product_type: row['Type'], tags: `${row.Tags || ''},Supplier:Ralawise`.replace(/^,/, ''),
-                    images: [], variants: [], options: []
+                    images: [], variants: [], options: [],
+                    // ================== FIX: Add internal set for de-duplication by options ==================
+                    _addedVariantOptions: new Set()
                 });
             }
             
             const product = productsByBaseSKU.get(baseSKU);
 
-            // Check if a variant with this SKU already exists for this product.
-            // This prevents the "variant already exists" error for new products caused by duplicate CSV rows.
-            if (product.variants.some(v => v.sku === variantSKU)) {
-                duplicateVariantRows++;
-                continue; // Skip this duplicate row
+            // ================== FIX: De-duplicate based on option values, not SKU ==================
+            // Create a unique key for the variant based on its options.
+            const variantOptionKey = [
+                row['Option1 Value'] || '', 
+                row['Option2 Value'] || '', 
+                row['Option3 Value'] || ''
+            ].join('||').toLowerCase();
+
+            // If we have already added a variant with this combination of options, skip it.
+            if (product._addedVariantOptions.has(variantOptionKey)) {
+                duplicateOptionRows++;
+                continue;
             }
+            product._addedVariantOptions.add(variantOptionKey);
             
             if (row['Image Src'] && !product.images.some(img => img.src === row['Image Src'])) {
                 product.images.push({ src: row['Image Src'] });
@@ -374,6 +380,8 @@ async function processProductImport() {
         }
         
         productsByBaseSKU.forEach(product => {
+            // We can now remove the helper property
+            delete product._addedVariantOptions;
             product.variants.forEach(variant => {
                 if (variant.option1 && product.options[0] && !product.options[0].values.includes(variant.option1)) product.options[0].values.push(variant.option1);
                 if (variant.option2 && product.options[1] && !product.options[1].values.includes(variant.option2)) product.options[1].values.push(variant.option2);
@@ -381,7 +389,7 @@ async function processProductImport() {
             });
         });
         
-        addLog(`Grouped into ${productsByBaseSKU.size} unique products (skipped ${skippedRows} rows without SKU, skipped ${duplicateVariantRows} duplicate variant rows)`, 'info');
+        addLog(`Grouped into ${productsByBaseSKU.size} unique products (skipped ${skippedRows} rows without SKU, skipped ${duplicateOptionRows} duplicate option rows)`, 'info');
         
         if (productsByBaseSKU.size === 0) throw new Error('No valid products found after grouping.');
         
@@ -417,16 +425,31 @@ async function processProductImport() {
                     const variantsToAdd = productData.variants.filter(v => !existingVariantsBySKU.has(v.sku.toUpperCase()));
                     
                     if (variantsToAdd.length > 0) {
+                        // ================== FIX: Merge existing options with new options to prevent update errors ==================
+                        const mergedOptions = JSON.parse(JSON.stringify(fullProduct.options)); // Deep copy
+                        productData.options.forEach(newOption => {
+                            const existingOption = mergedOptions.find(o => o.name === newOption.name);
+                            if (existingOption) {
+                                // Merge values into the existing option
+                                newOption.values.forEach(newValue => {
+                                    if (!existingOption.values.includes(newValue)) {
+                                        existingOption.values.push(newValue);
+                                    }
+                                });
+                            } else {
+                                // Add the new option entirely
+                                mergedOptions.push(newOption);
+                            }
+                        });
+
                         const updatePayload = {
                             product: {
                                 id: existingProduct.id,
                                 tags: productData.tags,
-                                variants: [...fullProduct.variants, ...variantsToAdd]
+                                variants: [...fullProduct.variants, ...variantsToAdd],
+                                options: mergedOptions
                             }
                         };
-                        if (productData.options && productData.options.length > 0) {
-                            updatePayload.product.options = productData.options;
-                        }
 
                         await shopifyRequestWithRetry('put', `/products/${existingProduct.id}.json`, updatePayload);
                         
@@ -451,6 +474,13 @@ async function processProductImport() {
                 } else {
                     addLog(`Creating new product: ${productData.title} (${baseSKU})`, 'info');
                     
+                    // ================== FIX: Handle Shopify's 100 variant limit ==================
+                    if (productData.variants.length > 100) {
+                        addLog(`⚠️ Skipping creation of ${productData.title} (${baseSKU}) - it has ${productData.variants.length} variants, which exceeds Shopify's limit of 100.`, 'warning');
+                        runResult.errors++;
+                        continue; // Skip to the next product
+                    }
+
                     const createData = { product: { ...productData, options: productData.options.length > 0 ? productData.options : undefined } };
                     const res = await shopifyRequestWithRetry('post', '/products.json', createData);
                     const createdProduct = res.data.product;
