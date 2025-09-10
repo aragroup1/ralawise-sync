@@ -129,6 +129,50 @@ async function getAllShopifyProducts() {
     return allProducts;
 }
 
+// ================== FIX START: Reusable Batch Processing Function ==================
+async function sendInventoryUpdatesInBatches(adjustments, reason) {
+    const BATCH_SIZE = 250; // Shopify's limit for this mutation
+    if (!adjustments || adjustments.length === 0) {
+        return;
+    }
+
+    const totalBatches = Math.ceil(adjustments.length / BATCH_SIZE);
+    addLog(`Found ${adjustments.length} inventory changes. Sending in ${totalBatches} batches of up to ${BATCH_SIZE}...`, 'info');
+
+    for (let i = 0; i < adjustments.length; i += BATCH_SIZE) {
+        const batch = adjustments.slice(i, i + BATCH_SIZE);
+        const currentBatchNum = Math.floor(i / BATCH_SIZE) + 1;
+        
+        addLog(`   Processing batch ${currentBatchNum} of ${totalBatches}... (${batch.length} items)`, 'info');
+
+        const mutation = `
+        mutation inventoryAdjustQuantities($input: InventoryAdjustQuantitiesInput!) {
+          inventoryAdjustQuantities(input: $input) {
+            userErrors {
+              field
+              message
+            }
+          }
+        }`;
+        
+        try {
+            await shopifyGraphQLRequest(mutation, { 
+                input: {
+                    name: "stock_update",
+                    reason: reason,
+                    changes: batch
+                }
+            });
+            addLog(`   ✅ Batch ${currentBatchNum} processed successfully.`, 'success');
+        } catch (error) {
+            addLog(`   ❌ Error processing batch ${currentBatchNum}: ${error.message}`, 'error');
+            throw error; // Re-throw to fail the entire sync process
+        }
+    }
+}
+// =================== FIX END: Reusable Batch Processing Function ===================
+
+
 async function processAutomatedDiscontinuations(ftpInventory, allShopifyProducts) {
     addLog('Starting automated discontinuation process...', 'info');
     let discontinuedCount = 0;
@@ -145,32 +189,16 @@ async function processAutomatedDiscontinuations(ftpInventory, allShopifyProducts
                 const inventoryAdjustments = product.variants
                     .filter(v => v.inventory_quantity > 0)
                     .map(v => ({
-                        // ================== FIX START: Correct GraphQL Payload Structure ==================
                         inventoryItemId: `gid://shopify/InventoryItem/${v.inventory_item_id}`,
                         locationId: config.shopify.locationId,
                         delta: -v.inventory_quantity
-                        // =================== FIX END: Correct GraphQL Payload Structure ===================
                     }));
 
+                // Use the new batching function for safety, though it's rare for one product to need it
+                await sendInventoryUpdatesInBatches(inventoryAdjustments, 'discontinued');
+                
                 if (inventoryAdjustments.length > 0) {
-                    const inventoryMutation = `
-                        mutation inventoryAdjustQuantities($input: InventoryAdjustQuantitiesInput!) {
-                          inventoryAdjustQuantities(input: $input) {
-                            userErrors {
-                              field
-                              message
-                            }
-                          }
-                        }`;
-                    
-                    await shopifyGraphQLRequest(inventoryMutation, {
-                        input: {
-                            name: "correction",
-                            reason: "discontinued",
-                            changes: inventoryAdjustments
-                        }
-                    });
-                    addLog(`   ✅ Set inventory to 0 for ${inventoryAdjustments.length} variants of '${product.title}'.`, 'success');
+                     addLog(`   ✅ Set inventory to 0 for ${inventoryAdjustments.length} variants of '${product.title}'.`, 'success');
                 } else {
                      addLog(`   ℹ️ No stock to adjust for '${product.title}'.`, 'info');
                 }
@@ -223,43 +251,24 @@ async function syncInventory() {
                     const shopifyQuantity = variant.inventory_quantity;
                     if (ftpQuantity !== shopifyQuantity) {
                         inventoryAdjustments.push({
-                            // ================== FIX START: Correct GraphQL Payload Structure ==================
                             inventoryItemId: `gid://shopify/InventoryItem/${variant.inventory_item_id}`,
                             locationId: config.shopify.locationId,
                             delta: ftpQuantity - shopifyQuantity
-                            // =================== FIX END: Correct GraphQL Payload Structure ===================
                         });
                     }
                 }
             }
         }
+        
+        // Use the new batching function to handle large updates
+        await sendInventoryUpdatesInBatches(inventoryAdjustments, 'stock_sync');
 
         if (inventoryAdjustments.length > 0) {
-            addLog(`Found ${inventoryAdjustments.length} variants requiring an inventory update. Sending bulk update...`, 'info');
-            
-            const mutation = `
-            mutation inventoryAdjustQuantities($input: InventoryAdjustQuantitiesInput!) {
-              inventoryAdjustQuantities(input: $input) {
-                userErrors {
-                  field
-                  message
-                }
-              }
-            }`;
-            
-            await shopifyGraphQLRequest(mutation, { 
-                input: {
-                    name: "correction",
-                    reason: "stock_sync",
-                    changes: inventoryAdjustments
-                }
-            });
-
-            addLog(`✅ Successfully sent bulk inventory update for ${inventoryAdjustments.length} variants.`, 'success');
-            runResult.updated = inventoryAdjustments.length;
+             addLog(`✅ Successfully sent bulk inventory updates for ${inventoryAdjustments.length} variants.`, 'success');
         } else {
             addLog('ℹ️ No inventory updates were needed.', 'info');
         }
+        runResult.updated = inventoryAdjustments.length;
 
         runResult.status = 'completed';
         const duration = ((Date.now() - startTime) / 1000).toFixed(2);
