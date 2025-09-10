@@ -37,17 +37,13 @@ const config = {
     },
     ralawise: { 
         maxInventory: parseInt(process.env.MAX_INVENTORY || '20'),
-        preservedSuppliers: ['Supplier:Ralawise', 'Supplier:Apify'],
-        discontinuedStockThreshold: 20,
         baseSKULength: 5
     },
     telegram: { 
         botToken: process.env.TELEGRAM_BOT_TOKEN, chatId: process.env.TELEGRAM_CHAT_ID 
     },
     failsafe: { 
-        inventoryChangePercentage: parseInt(process.env.FAILSAFE_INVENTORY_CHANGE_PERCENTAGE || '10'),
         maxRuntime: parseInt(process.env.MAX_RUNTIME_HOURS || '4') * 60 * 60 * 1000,
-        maxDiscontinuePercentage: 20
     },
     rateLimit: {
         requestsPerSecond: 2,
@@ -65,21 +61,12 @@ console.log(`Using Shopify Location ID: ${config.shopify.locationIdNumber}`);
 // ============================================
 
 let logs = [];
-let isRunning = { inventory: false, fullImport: false, cleanup: false, discontinue: false };
+let isRunning = { inventory: false, fullImport: false };
 let failsafe = { isTriggered: false, reason: '', timestamp: null };
 let isSystemPaused = false;
 const PAUSE_LOCK_FILE = path.join(__dirname, '_paused.lock');
 const HISTORY_FILE = path.join(__dirname, '_history.json');
 const UPLOADED_FILES_DIR = path.join(__dirname, 'uploaded_catalogs');
-const DISCONTINUED_FILES_DIR = path.join(__dirname, 'discontinued_files');
-let confirmation = { isAwaiting: false, message: '', details: {}, proceedAction: null, abortAction: null, jobKey: null };
-let runHistory = [];
-let syncProgress = { 
-    inventory: { isActive: false, current: 0, total: 0, startTime: null, estimatedCompletion: null, cancelled: false }, 
-    fullImport: { isActive: false, created: 0, discontinued: 0, updated: 0 },
-    cleanup: { isActive: false, current: 0, total: 0 },
-    discontinue: { isActive: false, current: 0, total: 0 }
-};
 
 [UPLOADED_FILES_DIR, path.join(__dirname, 'uploads')].forEach(dir => {
     if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
@@ -92,6 +79,7 @@ async function notifyTelegram(message) { if (!config.telegram.botToken || !confi
 function delay(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
 function triggerFailsafe(reason) { if (failsafe.isTriggered) return; failsafe = { isTriggered: true, reason, timestamp: new Date().toISOString() }; const msg = `🚨 FAILSAFE ACTIVATED: ${reason}`; addLog(msg, 'error'); notifyTelegram(msg); Object.keys(isRunning).forEach(key => isRunning[key] = false); }
 const shopifyClient = axios.create({ baseURL: config.shopify.baseUrl, headers: { 'X-Shopify-Access-Token': config.shopify.accessToken }, timeout: 60000 });
+let runHistory = [];
 function loadHistory() { try { if (fs.existsSync(HISTORY_FILE)) { runHistory = JSON.parse(fs.readFileSync(HISTORY_FILE, 'utf8')); } } catch (e) { addLog(`Could not load history: ${e.message}`, 'warning'); } }
 function saveHistory() { try { if (runHistory.length > 100) runHistory.pop(); fs.writeFileSync(HISTORY_FILE, JSON.stringify(runHistory, null, 2)); } catch (e) { addLog(`Could not save history: ${e.message}`, 'warning'); } }
 function addToHistory(runData) { runHistory.unshift(runData); saveHistory(); }
@@ -157,12 +145,14 @@ async function processAutomatedDiscontinuations(ftpInventory, allShopifyProducts
                 const inventoryAdjustments = product.variants
                     .filter(v => v.inventory_quantity > 0)
                     .map(v => ({
-                        inventoryItemId: v.inventory_item_id,
-                        availableDelta: -v.inventory_quantity
+                        // ================== FIX START: Correct GraphQL Payload Structure ==================
+                        inventoryItemId: `gid://shopify/InventoryItem/${v.inventory_item_id}`,
+                        locationId: config.shopify.locationId,
+                        delta: -v.inventory_quantity
+                        // =================== FIX END: Correct GraphQL Payload Structure ===================
                     }));
 
                 if (inventoryAdjustments.length > 0) {
-                    // ================== FIX START: Correct GraphQL Mutation ==================
                     const inventoryMutation = `
                         mutation inventoryAdjustQuantities($input: InventoryAdjustQuantitiesInput!) {
                           inventoryAdjustQuantities(input: $input) {
@@ -175,16 +165,15 @@ async function processAutomatedDiscontinuations(ftpInventory, allShopifyProducts
                     
                     await shopifyGraphQLRequest(inventoryMutation, {
                         input: {
-                            reason: "correction",
-                            changes: inventoryAdjustments,
-                            locationId: config.shopify.locationId
+                            name: "correction",
+                            reason: "discontinued",
+                            changes: inventoryAdjustments
                         }
                     });
                     addLog(`   ✅ Set inventory to 0 for ${inventoryAdjustments.length} variants of '${product.title}'.`, 'success');
                 } else {
                      addLog(`   ℹ️ No stock to adjust for '${product.title}'.`, 'info');
                 }
-                // =================== FIX END: Correct GraphQL Mutation ===================
 
                 await shopifyRequestWithRetry('put', `/products/${product.id}.json`, {
                     product: { id: product.id, status: 'draft' }
@@ -201,7 +190,7 @@ async function processAutomatedDiscontinuations(ftpInventory, allShopifyProducts
     return discontinuedCount;
 }
 
-const isSystemLocked = () => Object.values(isRunning).some(v => v) || isSystemPaused || failsafe.isTriggered || confirmation.isAwaiting;
+const isSystemLocked = () => Object.values(isRunning).some(v => v) || isSystemPaused || failsafe.isTriggered;
 
 async function syncInventory() {
     if (isSystemLocked()) {
@@ -234,8 +223,11 @@ async function syncInventory() {
                     const shopifyQuantity = variant.inventory_quantity;
                     if (ftpQuantity !== shopifyQuantity) {
                         inventoryAdjustments.push({
-                            inventoryItemId: variant.inventory_item_id,
-                            availableDelta: ftpQuantity - shopifyQuantity
+                            // ================== FIX START: Correct GraphQL Payload Structure ==================
+                            inventoryItemId: `gid://shopify/InventoryItem/${variant.inventory_item_id}`,
+                            locationId: config.shopify.locationId,
+                            delta: ftpQuantity - shopifyQuantity
+                            // =================== FIX END: Correct GraphQL Payload Structure ===================
                         });
                     }
                 }
@@ -244,8 +236,7 @@ async function syncInventory() {
 
         if (inventoryAdjustments.length > 0) {
             addLog(`Found ${inventoryAdjustments.length} variants requiring an inventory update. Sending bulk update...`, 'info');
-
-            // ================== FIX START: Correct GraphQL Mutation ==================
+            
             const mutation = `
             mutation inventoryAdjustQuantities($input: InventoryAdjustQuantitiesInput!) {
               inventoryAdjustQuantities(input: $input) {
@@ -258,12 +249,11 @@ async function syncInventory() {
             
             await shopifyGraphQLRequest(mutation, { 
                 input: {
-                    reason: "correction",
-                    changes: inventoryAdjustments,
-                    locationId: config.shopify.locationId
+                    name: "correction",
+                    reason: "stock_sync",
+                    changes: inventoryAdjustments
                 }
             });
-            // =================== FIX END: Correct GraphQL Mutation ===================
 
             addLog(`✅ Successfully sent bulk inventory update for ${inventoryAdjustments.length} variants.`, 'success');
             runResult.updated = inventoryAdjustments.length;
@@ -290,103 +280,7 @@ async function syncInventory() {
 // ============================================
 // API Endpoints
 // ============================================
-
-// Minimal product import functionality for completeness, including location ID fix.
-// Note: This function remains large and is included for completeness.
-async function processProductImport() {
-    if (isRunning.fullImport) return; 
-    isRunning.fullImport = true;
-    
-    let runResult = { type: 'Product Import', status: 'failed', created: 0, updated: 0, errors: 0, createdProducts: [], updatedProducts: [] };
-    const finalizeRun = (status) => {
-        runResult.status = status;
-        let createdProductsMessage = runResult.createdProducts.length > 0 ? `\n\n<b>New Products:</b>\n${runResult.createdProducts.slice(0,10).map(p => `- ${p.title}`).join('\n')}` : '';
-        let updatedProductsMessage = runResult.updatedProducts.length > 0 ? `\n\n<b>Updated Products:</b>\n${runResult.updatedProducts.slice(0,10).map(p => `- ${p.title}`).join('\n')}` : '';
-        notifyTelegram(`Product import ${runResult.status}:\n✅ ${runResult.created} created\n🔄 ${runResult.updated} updated\n❌ ${runResult.errors} errors${createdProductsMessage}${updatedProductsMessage}`);
-        isRunning.fullImport = false;
-        addToHistory({...runResult, timestamp: new Date().toISOString() });
-    };
-    
-    try {
-        addLog('=== PRODUCT IMPORT: CREATING/UPDATING PRODUCTS ===', 'info');
-        
-        // This helper function needs to be defined within scope or passed in. For simplicity, defining it here.
-        const getLatestCatalogFiles = () => {
-            try {
-                const productFiles = fs.existsSync(UPLOADED_FILES_DIR) ? 
-                    fs.readdirSync(UPLOADED_FILES_DIR).filter(f => f.endsWith('.csv')).map(f => ({
-                        name: f, path: path.join(UPLOADED_FILES_DIR, f),
-                        uploadTime: fs.statSync(path.join(UPLOADED_FILES_DIR, f)).mtime,
-                        size: fs.statSync(path.join(UPLOADED_FILES_DIR, f)).size
-                    })).sort((a, b) => b.uploadTime - a.uploadTime) : [];
-                return { productFiles, totalProductSize: productFiles.reduce((sum, f) => sum + f.size, 0) };
-            } catch (e) { return null; }
-        };
-
-        const catalogFiles = getLatestCatalogFiles();
-        if (!catalogFiles?.productFiles || catalogFiles.productFiles.length === 0) {
-            throw new Error('No product catalog files found. Please upload product CSV or ZIP files first.');
-        }
-        
-        const shopifyProducts = await getAllShopifyProducts();
-        const allRows = [];
-        for (const file of catalogFiles.productFiles) {
-            const rows = await new Promise((res, rej) => { const p = []; fs.createReadStream(file.path).pipe(csv()).on('data', r => p.push(r)).on('end', () => res(p)).on('error', rej); });
-            allRows.push(...rows);
-        }
-        
-        const productsByBaseSKU = new Map();
-        for (const row of allRows) {
-            const variantSKU = row['Variant SKU'] || ''; if (!variantSKU) continue;
-            const baseSKU = variantSKU.substring(0, 5).toUpperCase();
-            if (!productsByBaseSKU.has(baseSKU)) {
-                let cleanTitle = row.Title; if (cleanTitle && cleanTitle.includes(' - ')) { cleanTitle = cleanTitle.split(' - ').slice(1).join(' - '); }
-                productsByBaseSKU.set(baseSKU, { title: cleanTitle, handle: generateHandle(baseSKU, cleanTitle), body_html: row['Body (HTML)'], vendor: row.Vendor, product_type: row['Type'], tags: `${row.Tags || ''},Supplier:Ralawise`.replace(/^,/, ''), images: [], variants: [], options: [], _addedVariantOptions: new Set() });
-            }
-            const product = productsByBaseSKU.get(baseSKU);
-            const variantOptionKey = [row['Option1 Value'] || '', row['Option2 Value'] || '', row['Option3 Value'] || ''].join('||').toLowerCase();
-            if (product._addedVariantOptions.has(variantOptionKey)) continue;
-            product._addedVariantOptions.add(variantOptionKey);
-            if (row['Image Src'] && !product.images.some(img => img.src === row['Image Src'])) product.images.push({ src: row['Image Src'] });
-            product.variants.push({ sku: variantSKU, price: (parseFloat(row['Variant Price']) * 1.75).toFixed(2), option1: row['Option1 Value'] || null, option2: row['Option2 Value'] || null, option3: row['Option3 Value'] || null, inventory_quantity: Math.min(parseInt(row['Variant Inventory Qty']) || 0, 20), inventory_management: 'shopify' });
-            if (row['Option1 Name'] && !product.options.some(o => o.name === row['Option1 Name'])) product.options.push({ name: row['Option1 Name'], position: 1, values: [] });
-            if (row['Option2 Name'] && !product.options.some(o => o.name === row['Option2 Name'])) product.options.push({ name: row['Option2 Name'], position: 2, values: [] });
-            if (row['Option3 Name'] && !product.options.some(o => o.name === row['Option3 Name'])) product.options.push({ name: row['Option3 Name'], position: 3, values: [] });
-        }
-        
-        productsByBaseSKU.forEach(p => { delete p._addedVariantOptions; p.variants.forEach(v => { if (v.option1 && p.options[0] && !p.options[0].values.includes(v.option1)) p.options[0].values.push(v.option1); if (v.option2 && p.options[1] && !p.options[1].values.includes(v.option2)) p.options[1].values.push(v.option2); if (v.option3 && p.options[2] && !p.options[2].values.includes(v.option3)) p.options[2].values.push(v.option3); }); });
-
-        const existingProductsByBaseSKU = new Map(shopifyProducts.flatMap(p => p.variants.map(v => [v.sku?.substring(0, 5).toUpperCase(), p])).filter(([sku, p]) => sku));
-
-        for (const [baseSKU, productData] of productsByBaseSKU) {
-            try {
-                if (existingProductsByBaseSKU.has(baseSKU)) { // Update logic (simplified)
-                    addLog(`ℹ️ Product with base SKU ${baseSKU} already exists. Skipping update in this simplified function.`, 'info');
-                } else { // Create logic
-                    if (productData.variants.length > 100) { addLog(`⚠️ Skipping ${productData.title}: ${productData.variants.length} variants > 100 limit.`, 'warning'); continue; }
-                    const res = await shopifyRequestWithRetry('post', '/products.json', { product: productData });
-                    for (const variant of res.data.product.variants) {
-                        const originalVariant = productData.variants.find(v => v.sku === variant.sku);
-                        if (originalVariant?.inventory_quantity > 0) {
-                            await shopifyRequestWithRetry('post', '/inventory_levels/set.json', { 
-                                location_id: config.shopify.locationIdNumber, // FIX: Use numeric ID for REST
-                                inventory_item_id: variant.inventory_item_id, 
-                                available: originalVariant.inventory_quantity 
-                            });
-                        }
-                    }
-                    runResult.created++;
-                    addLog(`✅ Created: ${productData.title}`, 'success');
-                }
-            } catch (e) { runResult.errors++; addLog(`❌ Failed to process ${productData.title}: ${e.response?.data ? JSON.stringify(e.response.data) : e.message}`, 'error'); }
-        }
-        finalizeRun('completed');
-    } catch (e) { triggerFailsafe(`Product import failed: ${e.message}`); finalizeRun('failed'); }
-}
-
-
 app.post('/api/sync/inventory', (req, res) => { syncInventory(); res.json({ success: true }); });
-app.post('/api/import/products', (req, res) => { processProductImport(); res.json({ success: true }); });
 app.post('/api/pause/toggle', (req, res) => { isSystemPaused = !isSystemPaused; if (isSystemPaused) fs.writeFileSync(PAUSE_LOCK_FILE, 'paused'); else try { fs.unlinkSync(PAUSE_LOCK_FILE); } catch(e){} addLog(`System ${isSystemPaused ? 'PAUSED' : 'RESUMED'}.`, 'warning'); res.json({ success: true }); });
 app.post('/api/failsafe/clear', (req, res) => { failsafe = { isTriggered: false }; addLog('Failsafe cleared.', 'warning'); res.json({ success: true }); });
 
@@ -396,7 +290,7 @@ app.post('/api/failsafe/clear', (req, res) => { failsafe = { isTriggered: false 
 app.get('/', (req, res) => {
     const lastInventorySync = runHistory.find(r => r.type === 'Inventory Sync');
     
-    const html = `<!DOCTYPE html><html lang="en"><head><title>Ralawise Sync</title><meta name="viewport" content="width=device-width, initial-scale=1"><style>body{font-family:-apple-system,BlinkMacSystemFont,sans-serif;background:#0d1117;color:#c9d1d9;margin:0;line-height:1.5;}.container{max-width:1400px;margin:auto;padding:1rem;}.card{background:#161b22;border:1px solid #30363d;padding:1.5rem;border-radius:6px;margin-bottom:1rem;}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:1rem;}.btn{padding:0.5rem 1rem;border:1px solid #30363d;border-radius:6px;cursor:pointer;background:#21262d;color:#c9d1d9;font-weight:600;}.btn-primary{background:#238636;color:white;border-color:#2ea043;}.btn:disabled{opacity:0.5;cursor:not-allowed;}.logs{background:#010409;padding:1rem;height:300px;overflow-y:auto;border-radius:6px;font-family:monospace;white-space:pre-wrap;font-size:0.875em;}.alert-warning{background-color:rgba(210,149,34,0.1);border-color:#d29922;padding:1rem;border-radius:6px;margin-bottom:1rem;border:1px solid;}.stat-card{text-align:center;}.stat-value{font-size:2rem;font-weight:600;}.stat-label{font-size:0.8rem;color:#8b949e;}.location-info{font-size:0.875em;color:#8b949e;margin-top:0.5rem;}.section-header{font-size:1.1rem;font-weight:600;margin-bottom:0.5rem;color:#58a6ff;}</style></head><body><div class="container"><h1>Ralawise Sync</h1>
+    const html = `<!DOCTYPE html><html lang="en"><head><title>Ralawise Sync</title><meta name="viewport" content="width=device-width, initial-scale=1"><style>body{font-family:-apple-system,BlinkMacSystemFont,sans-serif;background:#0d1117;color:#c9d1d9;margin:0;line-height:1.5;}.container{max-width:1400px;margin:auto;padding:1rem;}.card{background:#161b22;border:1px solid #30363d;padding:1.5rem;border-radius:6px;margin-bottom:1rem;}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:1rem;}.btn{padding:0.5rem 1rem;border:1px solid #30363d;border-radius:6px;cursor:pointer;background:#21262d;color:#c9d1d9;font-weight:600;}.btn-primary{background:#238636;color:white;border-color:#2ea043;}.btn:disabled{opacity:0.5;cursor:not-allowed;}.logs{background:#010409;padding:1rem;height:300px;overflow-y:auto;border-radius:6px;font-family:monospace;white-space:pre-wrap;font-size:0.875em;}.alert-warning{background-color:rgba(210,149,34,0.1);border-color:#d29922;padding:1rem;border-radius:6px;margin-bottom:1rem;border:1px solid;}.stat-card{text-align:center;}.stat-value{font-size:2rem;font-weight:600;}.stat-label{font-size:0.8rem;color:#8b949e;}.location-info{font-size:0.875em;color:#8b949e;margin-top:0.5rem;}</style></head><body><div class="container"><h1>Ralawise Sync</h1>
     <div class="grid">
         <div class="card"><h2>System</h2><p>Status: ${isSystemPaused?'Paused':failsafe.isTriggered?'FAILSAFE': Object.values(isRunning).some(v => v) ? 'Busy' : 'Active'}</p><button onclick="apiPost('/api/pause/toggle')" class="btn" ${failsafe.isTriggered?'disabled':''}>${isSystemPaused?'Resume':'Pause'}</button>${failsafe.isTriggered?`<button onclick="apiPost('/api/failsafe/clear')" class="btn">Clear Failsafe</button>`:''}<div class="location-info">Location ID: ${config.shopify.locationIdNumber}</div></div>
         <div class="card"><h2>Inventory Sync</h2><p>Status: ${isRunning.inventory?'Running':'Ready'}</p><p>Syncs stock levels and <b>automatically discontinues</b> products not in the FTP file.</p><button onclick="apiPost('/api/sync/inventory','Run inventory sync?')" class="btn btn-primary" ${isSystemLocked()?'disabled':''}>Run Now</button></div>
